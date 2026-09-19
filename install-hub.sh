@@ -152,8 +152,8 @@ install_hub() {
 	# depends on useradd having created one.
 	install -d -m 0700 -o "$USER_NAME" "$DATA"
 
-	# A first run prints the one-time password, and only a missing database
-	# constitutes one. Checked before anything is installed.
+	# Only a missing database makes this a first install, which sets the
+	# password. Checked before anything is installed.
 	first=""
 	[ -f "$DATA/monitor.db" ] || first=1
 
@@ -238,17 +238,41 @@ MemoryMax=256M
 WantedBy=multi-user.target
 UNIT
 
+	# Taken from the binary's stdout rather than the journal, which some hosts
+	# keep nowhere. Set before the service starts, so the hub finds a password in
+	# place and does not generate a second one. A reset refuses a missing
+	# database, so the file is created first under the service user; SQLite reads
+	# an empty file as an empty database.
+	pw=""
+	if [ -n "$first" ]; then
+		install -m 0600 -o "$USER_NAME" /dev/null "$DATA/monitor.db"
+		# Quiet: a release predating the flag is handled after the start below.
+		pw="$(new_password 2>/dev/null)"
+	fi
+
 	systemctl daemon-reload
 	systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 	# Not left to set -e: a binary that cannot exec fails the job itself, which is
 	# precisely the case the rollback below exists for. Unguarded, the script
 	# would exit here with a raw systemd error and leave the hub down on the
 	# binary that just failed.
+	started="$(date '+%Y-%m-%d %H:%M:%S')"
 	systemctl restart "$SERVICE" || true
-	# is-active answers before a unit that exits immediately has done so, and the
-	# first run also computes an argon2 hash. Wait, then query.
+	# is-active answers before a unit that exits immediately has done so. Wait,
+	# then query.
 	sleep 3
 	if ! systemctl is-active --quiet "$SERVICE"; then
+		# A first install has nothing to keep serving, so there is no rollback.
+		# The new database holds nothing but a password never shown; it is removed
+		# so that a rerun is again a first install and shows one, and the unit is
+		# disabled, since any binary it started later -- on a reboot as well --
+		# would set a password on an empty database and print it only to the
+		# journal. A backup, if any, stays for the next run.
+		if [ -n "$first" ]; then
+			systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+			rm -f "$DATA/monitor.db" "$DATA/monitor.db-wal" "$DATA/monitor.db-shm"
+			die "服务启动失败。日志：journalctl -u $SERVICE -n 50"
+		fi
 		if [ -n "$backup" ]; then
 			install -m 0755 "$backup" "$BIN"
 			rm -f "$backup"
@@ -259,6 +283,13 @@ UNIT
 	fi
 	rm -f "$BIN.old"
 	ok "服务" "已启动并开机自启"
+	# A release predating --reset-password refuses it, and its first start sets
+	# the password and prints it to the journal instead. Only this start's lines:
+	# an earlier failed attempt printed a password for a database since removed.
+	if [ -n "$first" ] && [ -z "$pw" ]; then
+		pw="$(journalctl -u "$SERVICE" --since "$started" --no-pager 2>/dev/null |
+			sed -n 's/.*Emergency password: //p' | tail -1)"
+	fi
 
 	if [ -n "$first" ]; then done_title="安装完成"; else done_title="升级完成"; fi
 	printf '\n  %s%s%s\n' "$B" "$done_title" "$N"
@@ -266,13 +297,11 @@ UNIT
 	printf '\n'
 	field "面板" "${SITE:-http://127.0.0.1:$PORT}/admin"
 	if [ -n "$first" ]; then
-		pw="$(journalctl -u "$SERVICE" --since '-2 min' --no-pager 2>/dev/null |
-			sed -n 's/.*Emergency password: //p' | tail -1)"
 		if [ -n "$pw" ]; then
 			field "密码" "$pw"
-			field "    " "${D}只显示这一次，登录后到「设置」里改掉${N}"
+			field "    " "${D}记下来，登录后到「安全」里改掉${N}"
 		else
-			field "密码" "journalctl -u $SERVICE | grep Emergency"
+			field "密码" "没取到，重跑安装器选「重置密码」"
 		fi
 	fi
 	field "数据" "$DATA/monitor.db"
@@ -288,60 +317,31 @@ UNIT
 		printf '  %s还差一步：配个反向代理%s\n' "$B" "$N"
 		printf '     面板只监听本机，公网访问不到——这是故意的，凭证不会在链路上裸奔。\n'
 		printf '     用 nginx / caddy / cf tunnel 任选一种，把 hub.example.com 换成你的域名，\n'
-		printf '     配好之后用域名访问面板，我相信这难不倒你。\n\n'
-		proxy_configs
-		printf '\n     %s四点注意与完整说明见 README 的「反向代理」一节。%s\n' "$D" "$N"
+		printf '     配好之后用域名访问面板，我相信这难不倒你。\n'
+		# The documented configurations use the default port.
+		[ "$PORT" = 28080 ] || printf '     文档里的 28080 换成 %s。\n' "$PORT"
+		printf '     反向代理文档：https://monitor-document.pages.dev/install/reverse-proxy\n'
 	fi
 }
 
-# The three configurations, printed where they are needed rather than described:
-# the hub is unreachable until one of them is in place, so an installer that
-# stops at "put a proxy in front of it" leaves the install half done.
-#
-# The heredocs are unquoted so $PORT lands in them; every variable belonging to
-# the proxy is escaped, since nginx and caddy read those themselves.
-proxy_configs() {
-	printf '  %scaddy%s  Caddyfile\n' "$B" "$N"
-	cat <<CADDY
-hub.example.com {
-    reverse_proxy 127.0.0.1:$PORT
+# ---- password ----
+# Prints nothing on failure; the hub's own error reaches stderr. Running as root
+# is safe: SQLite gives the -wal and -shm files it creates the database file's
+# owner.
+new_password() {
+	"$BIN" --db "$DATA/monitor.db" --reset-password | sed -n 's/^Emergency password: //p'
 }
-CADDY
-	printf '\n  %snginx%s  /etc/nginx/sites-available/hub.example.com\n' "$B" "$N"
-	cat <<NGINX
-map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
 
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name hub.example.com;
-    ssl_certificate     /etc/letsencrypt/live/hub.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/hub.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:$PORT;
-        proxy_http_version 1.1;
-        # 导入备份与上传主题是分片传的，单片 4 MiB；这个数不随数据库增长。
-        client_max_body_size 8m;
-        proxy_set_header Host              \$host;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        # /api/agent/ws 与 /api/ws 是长连接。
-        proxy_set_header Upgrade    \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
-        proxy_buffering off;
-        proxy_read_timeout 1h;
-        proxy_send_timeout 1h;
-    }
-}
-NGINX
-	printf '\n  %scloudflare 隧道%s  config.yml（不用开任何入站端口）\n' "$B" "$N"
-	cat <<CFD
-ingress:
-  - hostname: hub.example.com
-    service: http://127.0.0.1:$PORT
-  - service: http_status:404
-CFD
+reset_password() {
+	# The data outlives --uninstall, so the database alone does not mean a hub.
+	if [ ! -f "$BIN" ] || [ ! -f "$DATA/monitor.db" ]; then
+		die "这台机器上没有装 monitor hub"
+	fi
+	confirm "重置面板密码？所有已登录的会话都会被登出" || return 0
+	pw="$(new_password)"
+	# Versions without the flag report "unknown argument" on stderr.
+	[ -n "$pw" ] || die "重置失败。上面提示 unknown argument 的话是 hub 版本太旧，先升级"
+	field "密码" "$pw"
 }
 
 # ---- uninstall ----
@@ -384,6 +384,7 @@ menu() {
 		printf '    2  卸载\n'
 		printf '    3  状态\n'
 		printf '    4  日志\n'
+		printf '    5  重置密码\n'
 		printf '    q  退出\n\n'
 		printf '  %s›%s ' "$B" "$N"
 		read -r choice || exit 0
@@ -405,6 +406,7 @@ menu() {
 		2) uninstall_hub; press ;;
 		3) systemctl status "$SERVICE" --no-pager || true; press ;;
 		4) journalctl -u "$SERVICE" -f --no-pager ;;
+		5) reset_password; press ;;
 		q | Q | exit | "") exit 0 ;;
 		*) ;;
 		esac
@@ -419,6 +421,8 @@ monitor hub 安装器
   sudo ./install-hub.sh --port 8443    指定端口安装
   sudo ./install-hub.sh --uninstall    卸载，保留数据
   sudo ./install-hub.sh --purge        卸载并删除数据库
+  sudo ./install-hub.sh --reset-password
+                                       重置面板密码，登出所有会话
 
   --port <n>     本机监听端口，默认 $PORT
   --site <url>   一般不用填。面板拼安装命令用的是浏览器地址栏，配好反代
@@ -429,7 +433,7 @@ monitor hub 安装器
   --help, -h     显示这段
 
 hub 只监听 127.0.0.1，公网访问不到，需要自己配 nginx / caddy / CF 隧道把
-域名指过来。装完会打印具体怎么配。
+域名指过来，配法见 https://monitor-document.pages.dev/install/reverse-proxy
 
 重跑一次就是升级：校验通过后才替换二进制，起不来会自动回滚到上一版；
 没写的参数沿用上次的，所以升级不会把端口和 --site 冲掉。
@@ -446,6 +450,7 @@ while [ $# -gt 0 ]; do
 	--site) [ $# -ge 2 ] || die "--site 后面要跟地址"; SITE="$2"; SITE_SET=1; shift 2 ;;
 	--uninstall) ACTION=uninstall; shift ;;
 	--purge) ACTION=uninstall; PURGE=1; shift ;;
+	--reset-password) ACTION=reset; shift ;;
 	--yes | -y) YES=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) die "未知参数：$1（--help 看用法）" ;;
@@ -486,6 +491,7 @@ command -v systemctl >/dev/null 2>&1 ||
 
 case "$ACTION" in
 uninstall) banner; uninstall_hub ;;
+reset) banner; reset_password ;;
 *)
 	if [ -t 0 ]; then
 		menu

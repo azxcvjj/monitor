@@ -441,7 +441,8 @@ async fn stream_live(app: Shared, mut socket: WebSocket, session: Option<String>
 /// from an otherwise valid https domain entry. `main` warns about that at
 /// startup; this is for whoever reads the panel rather than the journal.
 const PROVISIONING_DENIED: &str = "请通过 HTTPS 域名访问面板后添加或安装节点；\
-     如果已经是域名访问，检查反向代理是否透传了 Host 与 X-Forwarded-Proto（见 README 的反代配置）；\
+     如果已经是域名访问，检查反向代理是否透传了 Host 与 X-Forwarded-Proto\
+     （见 https://monitor-document.pages.dev/install/reverse-proxy）；\
      两者都没问题就检查 hub 的启动参数 --site，它必须是 https:// 加域名，不能是 IP、不能带路径";
 
 pub(crate) fn https_domain(site: &str) -> Option<reqwest::Url> {
@@ -1508,8 +1509,7 @@ pub async fn save_settings(
         // receives a replacement.
         if key == "admin_password" {
             match hash_password(value).and_then(|h| {
-                app.db.set("admin_password_hash", &h)?;
-                app.db.drop_all_sessions()?;
+                app.db.replace_password(&h)?;
                 issue_session(&app, &headers)
             }) {
                 Ok(cookie) => reissued = cookie,
