@@ -136,6 +136,16 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   )
 }
 
+// Every command the panel hands out. break-all because a token has no spaces to
+// wrap at.
+function Command({ className = "", children }: { className?: string; children: React.ReactNode }) {
+  return (
+    <pre className={`overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all ${className}`}>
+      {children}
+    </pre>
+  )
+}
+
 function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
   return (
     <div className={`space-y-2 ${className}`}>
@@ -146,14 +156,35 @@ function Field({ label, hint, className = "", children }: { label: string; hint?
   )
 }
 
+// A titled option with its control at the right. `toggle` makes the whole row a
+// label, so a click anywhere flips the Switch it holds.
+function OptionRow({ title, hint, toggle = false, children }: {
+  title: React.ReactNode
+  hint?: React.ReactNode
+  toggle?: boolean
+  children: React.ReactNode
+}) {
+  const Row = toggle ? "label" : "div"
+  return (
+    <Row className={`flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm ${toggle ? "cursor-pointer" : ""}`}>
+      <span>
+        <span className="block font-medium">{title}</span>
+        {hint && <span className="mt-0.5 block text-xs text-muted-foreground">{hint}</span>}
+      </span>
+      {children}
+    </Row>
+  )
+}
 
-function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm }: {
+
+function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
   title: string
   description: string
   confirmLabel: string
   busy?: boolean
   onClose: () => void
   onConfirm: () => void
+  children?: React.ReactNode
 }) {
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
@@ -162,6 +193,7 @@ function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription className="leading-relaxed">{description}</DialogDescription>
         </DialogHeader>
+        {children}
         <DialogFooter className="border-t pt-4">
           <Button variant="ghost" onClick={onClose}>取消</Button>
           <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
@@ -295,20 +327,12 @@ function NodeForm({ node, onClose, onSaved }: {
               </Field>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-                <span>
-                  <span className="block font-medium">公开显示</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
-                </span>
+              <OptionRow title="公开显示" hint="关闭后只在管理后台可见" toggle>
                 <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
-              </label>
-              <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-                <span>
-                  <span className="block font-medium">离线通知</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期、恢复时各推一条</span>
-                </span>
+              </OptionRow>
+              <OptionRow title="离线通知" hint="掉线超过宽限期、恢复时各推一条" toggle>
                 <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
-              </label>
+              </OptionRow>
             </div>
           </section>
           <section className="space-y-3 border-t pt-5">
@@ -470,14 +494,19 @@ function BillingForm({ node, onClose, onSaved }: {
   )
 }
 
+// Each command runs the hub's own install.sh and is offered only on an https
+// domain entry. `args` receives that entry, which the agent is also given as
+// --server.
+function scriptCommand(site: string, args: (site: string) => string[]) {
+  site = provisioningSite(site)
+  return site && `curl -fsSL ${site}/install.sh | sh -s -- ${args(site).join(" ")}`
+}
+
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
 function installCommand(site: string, token: string, seconds: number) {
-  site = provisioningSite(site)
-  if (!site) return ""
-  const args = [`--server ${site}`, `--token ${token}`, `--interval ${seconds}`]
-  return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`])
 }
 
 // One command for a batch of machines. The key belongs to the hub, is valid only
@@ -485,10 +514,13 @@ function installCommand(site: string, token: string, seconds: number) {
 // own, so unlike an install command this text is no one's credential and can be
 // used directly in a loop.
 function registerCommand(site: string, key: string) {
-  site = provisioningSite(site)
-  if (!site) return ""
-  const args = [`--server ${site}`, `--register ${key}`]
-  return `curl -fsSL ${site}/install.sh | sh -s -- ${args.join(" ")}`
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`])
+}
+
+// Carries no token, so it is the same for every node and remains valid after the
+// node is deleted.
+function uninstallCommand(site: string) {
+  return scriptCommand(site, () => ["--uninstall"])
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
@@ -551,21 +583,12 @@ function RegisterDialog({ site, reg, onClose }: {
             列表里，名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。
           </p>
           {command ? (
-            <div className="space-y-2">
-              <Label className="text-sm font-medium">安装命令</Label>
-              <pre className="h-24 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
-                {command}
-              </pre>
-              <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-                <span>
-                  <span className="block font-medium">窗口 {clock} 后自动关闭</span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">
-                    到点自动失效，装完了也可以现在就关
-                  </span>
-                </span>
+            <Field label="安装命令">
+              <Command className="h-24">{command}</Command>
+              <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
-              </div>
-            </div>
+              </OptionRow>
+            </Field>
           ) : (
             <Button onClick={reg.open}>开启一小时窗口</Button>
           )}
@@ -620,25 +643,18 @@ function InstallDialog({ node, site, onClose, onRotated }: {
           <Field label="上报间隔（秒）" hint="1–3600，默认 1 秒">
             <Input type="number" min={1} max={3600} value={interval} onChange={(e) => setInterval(e.target.value)} />
           </Field>
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">安装命令</Label>
-            <pre className="h-28 overflow-auto whitespace-pre-wrap break-all rounded-lg border bg-muted/40 p-3 text-xs leading-relaxed select-all">
+          <Field label="安装命令">
+            <Command className="h-28">
               {/* A node added before the hub kept tokens has nothing to show
                   until one is reissued. */}
               {command || "旧版本创建的凭证不可读取，换发后显示"}
-            </pre>
-          </div>
-          <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">换发凭证</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                旧凭证立即作废，agent 掉线，需用新命令重装
-              </span>
-            </span>
+            </Command>
+          </Field>
+          <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
               换发
             </Button>
-          </div>
+          </OptionRow>
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={onClose}>关闭</Button>
@@ -684,6 +700,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   // every node.
   const visible = searchNodes(order, query)
   const searching = query.trim() !== ""
+  const uninstall = canProvision ? uninstallCommand(site) : ""
 
   async function remove() {
     if (!deleting) return
@@ -909,7 +926,24 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
           busy={removing}
           onClose={() => setDeleting(null)}
           onConfirm={remove}
-        />
+        >
+          {/* Deleting the node leaves the agent running on the machine, retrying
+              with a token the hub no longer accepts. */}
+          {uninstall && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-sm font-medium">卸载 agent</Label>
+                <Button variant="ghost" size="sm" onClick={() => copy(uninstall)}>
+                  <Copy className="size-4" /> 复制
+                </Button>
+              </div>
+              <Command>{uninstall}</Command>
+              <p className="text-xs text-muted-foreground">
+                在这台机器上以 root 执行，停止 agent，删除二进制、env 文件和服务文件。
+              </p>
+            </div>
+          )}
+        </ConfirmDialog>
       )}
     </div>
   )
@@ -997,13 +1031,9 @@ function PingForm({ task, nodes, onClose, onSaved }: {
               <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
             </div>
             <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
-            <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-              <span>
-                <span className="block font-medium">新节点自动加入</span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">以后添加的节点自动运行此监控</span>
-              </span>
+            <OptionRow title="新节点自动加入" hint="以后添加的节点自动运行此监控" toggle>
               <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
-            </label>
+            </OptionRow>
           </section>
         </div>
         <DialogFooter>
