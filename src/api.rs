@@ -605,6 +605,9 @@ const REGISTER_WINDOW: i64 = 3600;
 /// hundred is well beyond a plausible batch and well short of a problem.
 const REGISTER_LIMIT: i64 = 100;
 
+/// The header in which `install.sh` sends the token the machine already holds.
+const HELD_TOKEN: &str = "x-node-token";
+
 /// Exchanges a registration key for a node token, so a batch of machines can be
 /// installed with one command rather than one panel visit each.
 ///
@@ -612,10 +615,15 @@ const REGISTER_LIMIT: i64 = 100;
 /// that has never contacted the hub. A key issued by the panel, valid only within
 /// [`REGISTER_WINDOW`], serves in place of a session.
 ///
-/// One request costs two setting reads, a `COUNT`, and one transaction inserting
-/// the `node` and `traffic` rows plus a `ping_node` row per `auto_join` probe, at
-/// most 64. It makes no outbound request, and the router's 64 KiB body limit
-/// bounds the name.
+/// One request costs at most a lookup on the token's unique index, two setting
+/// reads, a `COUNT`, and one transaction inserting the `node` and `traffic` rows
+/// plus a `ping_node` row per `auto_join` probe, at most 64. It makes no outbound
+/// request, and the router's 64 KiB body limit bounds the name. Requests in flight
+/// are not gated: each step is a point read or one small transaction under the
+/// database lock, as with the token lookup of the agent handshake, and an address
+/// locked out below reaches none of them. 120 concurrent callers with the window
+/// closed move the panel's median from 1.1 ms to 2.1-2.8 ms, with or without a
+/// held token, on three cores.
 pub async fn agent_register(
     State(app): State<Shared>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -636,9 +644,27 @@ pub async fn agent_register(
     if app.registrations.locked(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     }
+    // A rerun on a registered machine sends the token it already holds and
+    // receives it back while that token still opens a node, so the rerun adds no
+    // second node. Ahead of the window and the key: it creates nothing, returns
+    // only what the caller already holds -- which the 401 of the agent handshake
+    // reveals as well -- and must still succeed once the window has closed. A
+    // token whose node was deleted, or which was reissued, falls through.
+    if let Some(held) = headers.get(HELD_TOKEN).and_then(|v| v.to_str().ok()).filter(|t| !t.is_empty()) {
+        match app.db.node_by_token(held) {
+            Ok(Some(_)) => return held.to_owned().into_response(),
+            Ok(None) => {}
+            // Read as "no node", a failed lookup would register a second node for
+            // a machine whose node is intact.
+            Err(e) => return fail(e),
+        }
+    }
     // One answer for both "no window is open" and "that key is wrong": the
     // difference is only useful to someone who has neither.
-    let closed = || (StatusCode::FORBIDDEN, "registration is closed").into_response();
+    let closed = || {
+        (StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
+            .into_response()
+    };
     let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
     else {
@@ -653,7 +679,11 @@ pub async fn agent_register(
     }
     match app.db.nodes_created_since(until - REGISTER_WINDOW) {
         Ok(n) if n >= REGISTER_LIMIT => {
-            return (StatusCode::FORBIDDEN, "this window has registered enough nodes").into_response()
+            return (
+                StatusCode::FORBIDDEN,
+                "this window has registered enough nodes; open a new window from the panel's node list",
+            )
+                .into_response()
         }
         Err(e) => return fail(e),
         Ok(_) => {}
@@ -2358,6 +2388,53 @@ mod tests {
         let key = app.db.get("register_key").unwrap();
         assert_eq!(close_register(Admin, State(app.clone())).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(register(Some(&key), "c").await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(app.db.nodes().unwrap().len(), 1);
+    }
+
+    /// A rerun of the batch command on a registered machine keeps its node, also
+    /// after the window closed, until that node is deleted from the panel.
+    #[tokio::test]
+    async fn a_rerun_keeps_its_node_until_the_node_is_deleted() {
+        let app = std::sync::Arc::new(app());
+        let register = |key: &str, held: &str| {
+            let mut headers = domain_headers();
+            headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+            // curl omits a header whose value is empty, so a machine holding no
+            // token sends none.
+            if !held.is_empty() {
+                headers.insert(HELD_TOKEN, held.parse().unwrap());
+            }
+            agent_register(
+                State(app.clone()),
+                ConnectInfo("198.51.100.7:40000".parse().unwrap()),
+                headers,
+                "web-01".to_owned(),
+            )
+        };
+        let text = |r: Response| async {
+            String::from_utf8(axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec())
+                .unwrap()
+        };
+
+        open_register(Admin, State(app.clone()), domain_headers()).await;
+        let key = app.db.get("register_key").unwrap();
+        let token = text(register(&key, "").await).await;
+        let id = app.db.node_by_token(&token).unwrap().expect("token opens a node");
+
+        assert_eq!(text(register(&key, &token).await).await, token);
+        close_register(Admin, State(app.clone())).await;
+        assert_eq!(text(register(&key, &token).await).await, token, "the token outlives its window");
+        assert_eq!(app.db.nodes().unwrap().len(), 1);
+
+        // Deleted: the held token no longer answers, so a closed window refuses
+        // rather than handing back a token the agent would be refused with.
+        app.db.delete_node(id).unwrap();
+        assert_eq!(register(&key, &token).await.status(), StatusCode::FORBIDDEN);
+        open_register(Admin, State(app.clone()), domain_headers()).await;
+        let key = app.db.get("register_key").unwrap();
+        let fresh = text(register(&key, &token).await).await;
+        assert_ne!(fresh, token);
+        assert!(app.db.node_by_token(&fresh).unwrap().is_some());
         assert_eq!(app.db.nodes().unwrap().len(), 1);
     }
 
