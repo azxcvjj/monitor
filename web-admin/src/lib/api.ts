@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react"
 
 export type Metrics = {
+  /** The agent's `--iface`, empty for the default rules; absent from an agent predating it. */
+  iface?: string
   uptime: number
   cpu: number
   load: [number, number, number]
@@ -162,6 +164,47 @@ export function provisioningSite(site: string): string {
   } catch {
     return ""
   }
+}
+
+/** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
+export type IfaceChoice = { only: string; skip: string }
+
+// What the agent accepts as a name, less the leading `-` that marks an exclusion
+// in the flag itself. Narrower than a kernel interface name, and within what
+// install.sh admits into the env file OpenRC sources as shell.
+const IFACE_NAME = /^[A-Za-z0-9._][A-Za-z0-9._-]*$/
+
+const ifaceNames = (list: string) => list.split(",").map((n) => n.trim()).filter(Boolean)
+
+/** The first name the agent would refuse, or that would silently match nothing, and the list holding it. */
+export function badIfaceName(choice: IfaceChoice): { list: keyof IfaceChoice; name: string } | undefined {
+  for (const list of ["only", "skip"] as const) {
+    const name = ifaceNames(choice[list]).find((n) => !IFACE_NAME.test(n))
+    if (name !== undefined) return { list, name }
+  }
+}
+
+/** The `--iface` value for a choice; null while [badIfaceName] finds one. */
+export function ifaceSpec(choice: IfaceChoice): string | null {
+  if (badIfaceName(choice)) return null
+  return [...ifaceNames(choice.only), ...ifaceNames(choice.skip).map((n) => `-${n}`)].join(",")
+}
+
+export function ifaceChoice(spec: string): IfaceChoice {
+  const names = ifaceNames(spec)
+  return {
+    only: names.filter((n) => !n.startsWith("-")).join(","),
+    skip: names.filter((n) => n.startsWith("-")).map((n) => n.slice(1)).join(","),
+  }
+}
+
+/**
+ * The `--iface` a connected node's agent runs with. Empty means the default
+ * rules, which is also what an agent predating the flag applies; undefined
+ * means the node is not reporting and nothing is known.
+ */
+export function currentIface(node: Pick<Node, "metrics">): string | undefined {
+  return node.metrics ? (node.metrics.iface ?? "") : undefined
 }
 
 export class ApiError extends Error {

@@ -882,9 +882,10 @@ impl Db {
 
     /// Folds one report's raw kernel counters into the node's running totals.
     ///
-    /// A changed boot_id, or a counter that moved backwards, means the kernel
-    /// restarted its counting; the total must not follow it downward. `None`
-    /// denotes a report carrying no readable counters at all -- see below.
+    /// A changed boot_id, or a counter that moved backwards, means the readings
+    /// no longer continue the previous ones; the total must not follow them
+    /// downward. `None` denotes a report carrying no readable counters at all --
+    /// see below.
     ///
     /// The billing reset day is read here rather than passed in: it is one join
     /// from a row this already reads, and fetching it separately would cost every
@@ -935,7 +936,9 @@ impl Db {
         // first report has none. A reading that shrank under the same boot lost
         // one -- an interface included in the sum has disappeared -- so the
         // reading is the remainder of that history and booking it would count it
-        // twice. A changed boot_id means the counters restarted or,
+        // twice. A changed boot_id means the counters restarted, that the agent
+        // now sums a different set of interfaces (it appends a digest of them,
+        // so a device joining the sum is caught as well as one leaving it), or,
         // indistinguishably from here, that a second machine shares the token.
         // Realigning costs the seconds since the reboot; the alternative costs
         // hundreds of gigabytes against a total that only increases.
@@ -946,11 +949,13 @@ impl Db {
         let (d_rx, d_tx) = match counters {
             None => (0, 0),
             Some(_) if prev_boot.is_empty() || prev_boot != boot_id => {
-                // Logged in either case: on a healthy node this is a reboot,
-                // while one every few seconds indicates two machines sharing a
-                // token.
+                // Logged in either case: on a healthy node this is a reboot or
+                // the agent summing a different set of interfaces, while one
+                // every few seconds indicates two machines sharing a token or
+                // counted interfaces coming and going. The value stays out of
+                // the log: it is the agent's text.
                 if !prev_boot.is_empty() {
-                    info!("node {node_id} reports a new boot; re-aligning");
+                    info!("node {node_id} reports a new boot_id; re-aligning");
                 }
                 (0, 0)
             }
