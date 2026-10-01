@@ -59,6 +59,8 @@ export type Node = {
   hostname?: string
   /** ISO 3166-1 alpha-2 as shown: the one set by hand, else the one looked up from the node's address. */
   country: string
+  /** Set by hand and public; empty is ungrouped. Absent from a hub predating groups. */
+  group?: string
   /** Panel only. Set by hand; empty is automatic. */
   country_pin?: string
   /** Panel only. The looked-up country, which a pin hides. */
@@ -69,6 +71,13 @@ export type Node = {
   /** Panel only. Set by hand, each replacing the address shown for its family. */
   ipv4_pin?: string
   ipv6_pin?: string
+  /** Panel only. What the hub shows: at most one per family, v4 first. */
+  addresses?: { address: string; source: Source }[]
+  /** Panel only. What each family shows with its pin cleared; empty for none. */
+  ipv4_auto?: string
+  ipv6_auto?: string
+  /** Panel only. The agent's reporting interval in seconds, read from its reports; null until two have arrived. */
+  interval?: number | null
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
@@ -78,9 +87,131 @@ export type Node = {
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[]; auto_join: boolean }
 
+/** Every group in use, in the order of the first node carrying it: the node order decides the group order. */
+export function groupsOf(nodes: Pick<Node, "group">[]): string[] {
+  return [...new Set(nodes.map((n) => n.group ?? "").filter(Boolean))]
+}
+
+/** A group filter as its dropdown holds it: "all", "none" for the ungrouped, or "=" and a group's name. */
+export function inGroup<T extends Pick<Node, "group">>(nodes: T[], filter: string): T[] {
+  if (filter === "all") return nodes
+  const group = filter === "none" ? "" : filter.slice(1)
+  return nodes.filter((n) => (n.group ?? "") === group)
+}
+
 /** Form snapshots must never overwrite fields the user did not edit. */
 export function changes<T extends object>(initial: T, values: Partial<T>): Partial<T> {
   return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== initial[key as keyof T])) as Partial<T>
+}
+
+/** One field of the settings form a theme declares under `config` in its `theme.json`. */
+export type ConfigField = {
+  key: string
+  type: "string" | "text" | "number" | "boolean" | "select"
+  label?: string
+  help?: string
+  default: unknown
+  options?: { value: string; label?: string }[]
+  min?: number
+  max?: number
+}
+
+/** A heading between fields. It holds no value. */
+export type ConfigTitle = { type: "title"; label: string }
+
+const CONFIG_TYPES = ["string", "text", "number", "boolean", "select"]
+
+/** Whether `value` is one the field can hold, the same test a theme applies to what it reads. */
+export function fits(field: ConfigField, value: unknown): boolean {
+  switch (field.type) {
+    case "boolean":
+      return typeof value === "boolean"
+    case "number":
+      return typeof value === "number" && Number.isFinite(value)
+        && (field.min === undefined || value >= field.min) && (field.max === undefined || value <= field.max)
+    case "select":
+      return !!field.options?.some((option) => option.value === value)
+    default:
+      return typeof value === "string"
+  }
+}
+
+/**
+ * The entries of a theme's form the panel can draw, headings included, in the
+ * manifest's order. The manifest is the theme author's, so a malformed entry is
+ * left out rather than failing the form: a heading without a label or without
+ * a field under it, a duplicate key, an unknown type, a label or help that is
+ * not text (rendering one would throw and blank the panel), a select whose
+ * options are not all non-empty strings (the dropdown cannot hold an empty
+ * value), or a default the field could not hold.
+ */
+export function configForm(config: unknown): (ConfigField | ConfigTitle)[] {
+  if (!Array.isArray(config)) return []
+  const seen = new Set<string>()
+  const text = (value: unknown) => value === undefined || typeof value === "string"
+  const drawable = config.filter((field): field is ConfigField | ConfigTitle => {
+    if (typeof field !== "object" || field === null) return false
+    if (field.type === "title") return typeof field.label === "string" && field.label !== ""
+    const { key, type, label, help, options, min, max } = field
+    const ok = typeof key === "string" && key !== "" && !seen.has(key) && CONFIG_TYPES.includes(type)
+      && text(label) && text(help)
+      && (type !== "select" || (Array.isArray(options)
+        && options.every((o) => typeof o?.value === "string" && o.value !== "" && text(o.label))))
+      && [min, max].every((bound) => bound === undefined || typeof bound === "number")
+      && fits(field, field.default)
+    if (ok) seen.add(key)
+    return ok
+  })
+  return drawable.filter((entry, i) => {
+    const next = drawable[i + 1]
+    return entry.type !== "title" || (next !== undefined && next.type !== "title")
+  })
+}
+
+/** The entries of the form that hold a value. */
+export function configFields(config: unknown): ConfigField[] {
+  return configForm(config).filter((entry): entry is ConfigField => entry.type !== "title")
+}
+
+/**
+ * The form split at its headings. Fields ahead of the first heading form a
+ * section of their own; `configForm` has already dropped every heading with no
+ * field under it, so every section has something to show.
+ */
+export function configSections(form: (ConfigField | ConfigTitle)[]): { label: string; fields: ConfigField[] }[] {
+  const sections: { label: string; fields: ConfigField[] }[] = []
+  for (const entry of form) {
+    if (entry.type === "title") sections.push({ label: entry.label, fields: [] })
+    else {
+      if (!sections.length) sections.push({ label: "通用", fields: [] })
+      sections[sections.length - 1].fields.push(entry)
+    }
+  }
+  return sections
+}
+
+/** The value each field shows: the saved one while the field can still hold it, else the default. */
+export function configValues(fields: ConfigField[], saved: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(fields.map((f) => [f.key, fits(f, saved[f.key]) ? saved[f.key] : f.default]))
+}
+
+/**
+ * What the panel stores: only the fields that differ from their defaults, so a
+ * default the theme changes later reaches every site that never altered it.
+ * Keys in `saved` the current form does not declare are kept -- a field a
+ * newer version dropped returns with a downgrade; an empty `saved` clears them.
+ */
+export function configOverrides(
+  fields: ConfigField[],
+  saved: Record<string, unknown>,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...saved }
+  for (const field of fields) {
+    if (values[field.key] === field.default) delete next[field.key]
+    else next[field.key] = values[field.key]
+  }
+  return next
 }
 
 export const GIB = 1024 ** 3
@@ -107,52 +238,21 @@ export function trafficCorrection(
 }
 
 /**
- * Globally routable. v4 excludes RFC 1918, CGNAT, loopback, link-local, 0/8,
- * 192.0.0/24, 198.18/15 (the fake-IP range of TUN-mode proxies), multicast and
- * reserved; v6 counts 2000::/3 only, leaving out ULA and link-local. The agent
- * ranks its interfaces and the hub picks the country's address by the same
- * ranges; the three lists are to be changed together.
+ * An address as the node table shows it. An IPv6 longer than 22 characters --
+ * a full SLAAC address runs to 39 -- keeps its first two groups and its last
+ * two, which name the provider and tell machines on one prefix apart, and
+ * elides the middle. The groups are cut from the text as written, so a `::`
+ * inside what is kept stays intact rather than reading as a lone colon.
  */
-export function isPublic(ip: string): boolean {
-  if (ip.includes(":")) return (parseInt(ip.split(":")[0] || "0", 16) & 0xe000) === 0x2000
-  const [a, b, c] = ip.split(".").map(Number)
-  return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 100 && b >= 64 && b < 128) ||
-    (a === 169 && b === 254) || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 0 && c === 0) ||
-    (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)))
+export function shortAddress(address: string): string {
+  const groups = [...address.matchAll(/[^:]+/g)]
+  if (address.length <= 22 || groups.length < 5) return address
+  const head = groups[1], tail = groups[groups.length - 2]
+  return `${address.slice(0, head.index + head[0].length)}…${address.slice(tail.index)}`
 }
 
 /** Where a shown address comes from, which the panel gives as its tooltip. */
 export type Source = "manual" | "interface" | "exit" | "connection"
-
-/**
- * The addresses shown for a node: at most one per family, v4 first, the one the
- * machine is reached by. The agent reports its interfaces; `ip` is where its
- * connection arrived from, which the hub canonicalizes to dotted form for IPv4.
- *
- * Per family an address set by hand comes first, then a public one on the
- * interface. Failing both, where the interface holds only a private address of
- * the family the connection used -- NAT, or a proxy in front -- the connection's
- * public address, its exit, stands in. An exit in a family the interface does
- * not hold is a translator such as NAT64 or WARP and is left out.
- *
- * Private addresses appear only when nothing public is known, as where hub and
- * node share a network and they are all there is. `ip` alone is the fallback
- * for an agent reporting no interface.
- */
-export function addresses(
-  node: Pick<Node, "ip" | "ipv4" | "ipv6" | "ipv4_pin" | "ipv6_pin">,
-): { address: string; source: Source }[] {
-  const { ip = "", ipv4 = "", ipv6 = "", ipv4_pin = "", ipv6_pin = "" } = node
-  const family = (pin: string, held: string, v6: boolean): { address: string; source: Source } | null =>
-    pin ? { address: pin, source: "manual" }
-      : held && isPublic(held) ? { address: held, source: "interface" }
-      : held && isPublic(ip) && ip.includes(":") === v6 ? { address: ip, source: "exit" }
-      : null
-  const shown = [family(ipv4_pin, ipv4, false), family(ipv6_pin, ipv6, true)].filter((a) => a !== null)
-  if (shown.length) return shown
-  if (ipv4 || ipv6) return [ipv4, ipv6].filter(Boolean).map((address) => ({ address, source: "interface" }))
-  return ip ? [{ address: ip, source: "connection" }] : []
-}
 
 /** Installation commands require a TLS origin with a domain, never an IP. */
 export function provisioningSite(site: string): string {
@@ -195,6 +295,32 @@ export function provisionRefusal(origin: string, site: string): string {
   return loopbackOrigin(origin)
     ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定节点可达的 https 域名。"
     : "请通过 HTTPS 域名访问面板后添加或安装节点。"
+}
+
+/** `1.2.3` as numbers, or null for anything else. */
+const versionParts = (v: string) => (/^\d+(\.\d+)*$/.test(v) ? v.split(".").map(Number) : null)
+
+/**
+ * Whether `current` names an earlier release than `latest`; missing components
+ * count as 0. An empty side is never behind: a node that has not reported
+ * carries no version, and an unreachable GitHub leaves no latest. A build ahead
+ * of the release -- one compiled locally -- is not behind either. Versions that
+ * are not `1.2.3` can only be compared for equality.
+ */
+export function behind(current: string, latest: string): boolean {
+  if (!current || !latest) return false
+  const a = versionParts(current)
+  const b = versionParts(latest)
+  if (!a || !b) return current !== latest
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) < (b[i] ?? 0)
+  }
+  return false
+}
+
+/** The nodes running an earlier agent than the published one. */
+export function outdatedAgents<T extends { agent_version: string }>(nodes: T[], latest: string): T[] {
+  return nodes.filter((n) => behind(n.agent_version, latest))
 }
 
 /** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
@@ -246,13 +372,49 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Every error the hub answers is one line of plain text written for the reader.
+ * Anything else came from something in front of it -- a proxy's error page, a
+ * CDN's challenge, an empty 502 -- and is described by its status instead.
+ */
+async function failure(res: Response): Promise<ApiError> {
+  const text = res.headers.get("content-type")?.startsWith("text/plain") ? (await res.text()).trim() : ""
+  if (text) return new ApiError(res.status, text)
+  return new ApiError(
+    res.status,
+    res.status >= 500
+      ? `hub 没有正常响应（HTTP ${res.status}），检查 hub 是否在运行、反向代理是否指向它`
+      : `请求被拦截（HTTP ${res.status}），不是 hub 的回复，检查反向代理或 CDN 的设置`,
+  )
+}
+
+/** `fetch`, failing with a message for the reader when nothing answers at all. */
+async function send(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (e) {
+    // An abort was asked for, and the caller tells it apart by name.
+    if ((e as Error).name === "AbortError") throw e
+    throw new ApiError(0, "连不上 hub，检查网络后重试")
+  }
+}
+
+/** A success from the hub is JSON; a 200 carrying HTML is a proxy's page. */
+async function json<T>(res: Response): Promise<T> {
+  try {
+    return await res.json()
+  } catch {
+    throw new ApiError(res.status, "收到的不是 hub 的回复，检查反向代理是否把 /api 转给了 hub")
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await send(`/api${path}`, {
     ...init,
     headers: init?.body ? { "content-type": "application/json", ...init?.headers } : init?.headers,
   })
-  if (!res.ok) throw new ApiError(res.status, (await res.text()) || res.statusText)
-  return res.status === 204 ? (undefined as T) : res.json()
+  if (!res.ok) throw await failure(res)
+  return res.status === 204 ? (undefined as T) : json<T>(res)
 }
 
 /**
@@ -280,26 +442,22 @@ export async function upload<T>(
     // the last piece lands, and `offset = 0` truncates whatever an abandoned
     // attempt left behind, so aborting here leaves the state unchanged.
     if (signal?.aborted) throw new DOMException("aborted", "AbortError")
-    const res = await fetch(`/api${path}?offset=${offset}&total=${file.size}`, {
+    const res = await send(`/api${path}?offset=${offset}&total=${file.size}`, {
       method: "POST",
       headers: { "content-type": "application/octet-stream" },
       body: file.slice(offset, offset + CHUNK),
       signal,
     })
-    if (!res.ok) {
-      // A 413 never reached the hub: the proxy in front answered, and only its
-      // own logs record it. The message names the setting responsible.
-      throw new ApiError(
-        res.status,
-        res.status === 413
-          ? "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m"
-          : (await res.text()) || res.statusText,
-      )
+    // A 413 never reached the hub: the proxy in front answered, and only its
+    // own logs record it. The message names the setting responsible.
+    if (res.status === 413) {
+      throw new ApiError(413, "反向代理拒收了 4 MiB 的分片，把 nginx 的 client_max_body_size 调到 8m")
     }
+    if (!res.ok) throw await failure(res)
     last = res
     onProgress?.(Math.min(offset + CHUNK, file.size))
   }
-  return last!.json()
+  return json<T>(last!)
 }
 
 /**
@@ -321,14 +479,18 @@ export function useNodes() {
     let retry: ReturnType<typeof setTimeout> | null = null
     let closed = false
 
+    // A refresh replaces this effect, and an answer to the one it replaced may
+    // still arrive after the newer one; it is dropped rather than shown.
     const fetchOnce = () =>
       api<{ nodes: Node[]; admin: boolean }>("/nodes")
         .then((d) => {
+          if (closed) return
           setNodes(d.nodes)
           setAdmin(d.admin)
           setError(null)
         })
         .catch((e: Error) => {
+          if (closed) return
           setError(e.message)
           // With the public page switched off, a revoked session receives a 401
           // here and on the stream, so the frame that would report admin=false

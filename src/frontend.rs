@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode, Uri};
@@ -13,6 +13,7 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::api::answer;
 use crate::auth::random_token;
 use crate::{App, Shared};
 
@@ -41,6 +42,12 @@ pub struct Theme {
     pub version: String,
     pub author: String,
     pub url: String,
+    /// The settings form the panel draws for this theme. Passed through
+    /// unparsed: a malformed field costs that one field in the panel rather than
+    /// removing the whole theme from the list, and a hub predating the field
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
     #[serde(default)]
     pub selected: bool,
     /// Set only for the copy embedded in the binary. Never read from a manifest:
@@ -48,22 +55,22 @@ pub struct Theme {
     /// deleted.
     #[serde(skip_deserializing)]
     pub builtin: bool,
+    /// Whether [`preview`] has an image for it. Filled in for the panel's list
+    /// only, so it lays each card out once rather than when the image arrives.
+    #[serde(skip_deserializing)]
+    pub preview: bool,
 }
 
 pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let known = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok());
     if is_api_path(path) {
-        return (StatusCode::NOT_FOUND, format!("no such endpoint: /{path}")).into_response();
+        return answer(StatusCode::NOT_FOUND, format!("没有这个接口：/{path}"));
     }
 
     if path == "admin" || path.starts_with("admin/") {
         let path = path.strip_prefix("admin").unwrap_or(path).trim_start_matches('/');
-        return embedded::<AdminAssets>(
-            path,
-            "the panel is not built; run `npm run build` in web-admin/",
-            known,
-        );
+        return embedded::<AdminAssets>(path, "面板没有构建，在 web-admin/ 下运行 npm run build", known);
     }
 
     let theme = app.db.get("theme").unwrap_or_default();
@@ -72,7 +79,7 @@ pub async fn serve(State(app): State<Shared>, headers: HeaderMap, uri: Uri) -> R
             return response;
         }
     }
-    embedded::<DefaultThemeAssets>(path, "the default theme is missing; run scripts/theme.sh", known)
+    embedded::<DefaultThemeAssets>(path, "默认主题缺失，运行 scripts/theme.sh", known)
 }
 
 fn is_api_path(path: &str) -> bool {
@@ -94,11 +101,11 @@ fn embedded<T: RustEmbed>(requested: &str, remedy: &str, known: Option<&str>) ->
         return asset(path, file.data.into_owned(), known);
     }
     if is_asset(path) {
-        return (StatusCode::NOT_FOUND, format!("no such asset: /{path}")).into_response();
+        return answer(StatusCode::NOT_FOUND, format!("没有这个文件：/{path}"));
     }
     match T::get("index.html") {
         Some(index) => asset("index.html", index.data.into_owned(), known),
-        None => (StatusCode::NOT_FOUND, remedy.to_owned()).into_response(),
+        None => answer(StatusCode::NOT_FOUND, remedy),
     }
 }
 
@@ -162,7 +169,7 @@ fn read_inside(root: &Path, relative: &str) -> Option<Vec<u8>> {
 /// name and anything carrying a path separator. `default` is admitted: an
 /// installed copy of the built-in theme takes that name and is served in its
 /// place, leaving the embedded one as the fallback beneath it.
-fn valid_short(short: &str) -> bool {
+pub fn valid_short(short: &str) -> bool {
     !short.is_empty() && short.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
@@ -254,6 +261,11 @@ const MAX_ENTRIES: usize = 2_000;
 const MAX_FILE: u64 = 8 << 20;
 const MAX_EXPANDED: u64 = 64 << 20;
 
+/// What may follow tar's end marker, which is padding to a whole record: 10 KiB
+/// by default, and a mebibyte covers any blocking factor in use. Unbounded,
+/// zeros there would inflate at 1 GiB per MiB uploaded, 1.4 s of CPU each.
+const MAX_PADDING: u64 = 1 << 20;
+
 /// Installs a theme from its published `theme.tar.gz`, under the name its own
 /// manifest carries.
 ///
@@ -275,37 +287,89 @@ pub fn install<R: Read>(themes: &Path, archive: R, expect: Option<&str>) -> Resu
     installed
 }
 
+/// The answer to any archive that cannot be read to the end: a download cut
+/// short, which is how a partial `theme.tar.gz` fails, or a gzip stream that is
+/// corrupt or holds no tar.
+const DAMAGED: &str = "主题包损坏或不完整（可能没下载完），重新下载 theme.tar.gz 再试";
+
+/// The answer to an archive whose entries cannot all be written: a file and a
+/// directory under one name, or a name the filesystem refuses.
+const TANGLED: &str = "主题包里有同名的文件和目录，或者文件名过长，包本身有问题，请联系主题作者";
+
+/// The answer to a file that is not gzip at all, most often the release's
+/// Source code zip. Reported as [`DAMAGED`], it would direct the reader to
+/// download the same wrong file again.
+const NOT_GZIP: &str = "选的不是主题包：到主题仓库的 Releases 下载 theme.tar.gz，不要选 Source code";
+
+/// The first two bytes of every gzip stream.
+pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// Tells a failure the archive caused from one of this machine's. Reading fails
+/// with `UnexpectedEof` where the stream stops short and `InvalidInput` for a
+/// corrupt one; a layout that cannot be written fails with the
+/// second group. Anything else -- a full disk, a permission -- is this machine's
+/// to fix.
+fn archive_error(e: std::io::Error) -> anyhow::Error {
+    use std::io::ErrorKind::*;
+    let shown = match e.kind() {
+        UnexpectedEof | InvalidInput | InvalidData => DAMAGED,
+        NotADirectory | IsADirectory | AlreadyExists | InvalidFilename => TANGLED,
+        _ => return e.into(),
+    };
+    anyhow::Error::from(e).context(crate::Shown(shown.into()))
+}
+
 fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
+    let mut archive = std::io::BufReader::new(archive);
+    if !std::io::BufRead::fill_buf(&mut archive)?.starts_with(&GZIP_MAGIC) {
+        refuse!("{NOT_GZIP}");
+    }
     fs::create_dir(into)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut expanded = 0u64;
     for (seen, entry) in archive.entries()?.enumerate() {
-        let mut entry = entry.context("主题包不是有效的 tar.gz")?;
+        // Only reading happens here, so every failure is the archive's.
+        let mut entry = entry.context(crate::Shown(DAMAGED.into()))?;
         if seen >= MAX_ENTRIES {
-            bail!("主题包里的条目超过 {MAX_ENTRIES} 个");
+            refuse!("主题包里的条目超过 {MAX_ENTRIES} 个");
         }
         // Only the entry types a theme consists of. A symlink, hard link or
         // device node belongs in none, and each is a route to writing where the
         // path check below cannot see.
         let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
-            bail!("主题包里有不支持的条目：{}", entry.path()?.display());
+        // Also a pax global header: metadata that writes nothing, which
+        // `git archive` and GitHub's Source code archives open with. Refusing
+        // it would hide the answer that names the right file to download.
+        let metadata = kind.is_pax_global_extensions();
+        if !kind.is_file() && !kind.is_dir() && !metadata {
+            refuse!("主题包里有不支持的条目：{}", entry.path()?.display());
         }
         let size = entry.size();
         if size > MAX_FILE {
-            bail!("{} 超过单个文件 {} MiB 的上限", entry.path()?.display(), MAX_FILE >> 20);
+            refuse!("{} 超过单个文件 {} MiB 的上限", entry.path()?.display(), MAX_FILE >> 20);
         }
         // Subtraction, because summing two entry sizes can overflow; `size` is
         // already known to be the smaller of the two.
         if expanded > MAX_EXPANDED - size {
-            bail!("主题包解压后超过 {} MiB", MAX_EXPANDED >> 20);
+            refuse!("主题包解压后超过 {} MiB", MAX_EXPANDED >> 20);
         }
         expanded += size;
+        if metadata {
+            continue;
+        }
         // Rejects an entry whose path escapes `into` -- absolute, `..`, or via
         // a symlinked parent -- reporting `false` rather than an error.
-        if !entry.unpack_in(into)? {
-            bail!("主题包里的路径越出了主题目录");
+        if !entry.unpack_in(into).map_err(archive_error)? {
+            refuse!("主题包里的路径越出了主题目录");
         }
+    }
+    // Read to the end, where gzip keeps its checksum. The entries stop at tar's
+    // end marker, short of it, so otherwise an archive whose bytes changed in
+    // transit would install as long as its headers survived.
+    let mut rest = archive.into_inner();
+    std::io::copy(&mut (&mut rest).take(MAX_PADDING), &mut std::io::sink()).map_err(archive_error)?;
+    if rest.read(&mut [0]).map_err(archive_error)? != 0 {
+        refuse!("主题包在 tar 结尾之后还有超过 1 MiB 的数据，包本身有问题，请联系主题作者");
     }
     Ok(())
 }
@@ -313,24 +377,29 @@ fn unpack<R: Read>(archive: R, into: &Path) -> Result<()> {
 /// Checks the unpacked directory is a theme this hub can actually serve, then
 /// moves it into place under the name its manifest asks for.
 fn publish(themes: &Path, staging: &Path, expect: Option<&str>) -> Result<Theme> {
-    let manifest = read_inside(staging, "theme.json").context("主题包里没有 theme.json")?;
+    // Source code (tar.gz) is gzip'd too, and nests everything one directory
+    // down, so it fails here rather than at the magic bytes.
+    let Some(manifest) = read_inside(staging, "theme.json") else {
+        refuse!("主题包里没有 theme.json，下载的若是 Source code，换成 Releases 里的 theme.tar.gz")
+    };
     if manifest.len() > 64 * 1024 {
-        bail!("theme.json 过大");
+        refuse!("theme.json 过大");
     }
-    let theme: Theme = serde_json::from_slice(&manifest).context("theme.json 格式不对")?;
+    let theme: Theme =
+        serde_json::from_slice(&manifest).context(crate::Shown("theme.json 格式不对".into()))?;
     if !valid_short(&theme.short) {
-        bail!("theme.json 里的 short 不能作为目录名：{:?}", theme.short);
+        refuse!("theme.json 里的 short 不能作为目录名：{:?}", theme.short);
     }
     // An update replaces the theme it was invoked for. A package whose manifest
     // carries a different `short` would instead install a second theme, or
     // overwrite an unrelated one, while reporting success for the update.
     if let Some(expected) = expect.filter(|&expected| expected != theme.short) {
-        bail!("这个包里是主题 {:?}，不是 {expected:?}", theme.short);
+        refuse!("这个包里是主题 {:?}，不是 {expected:?}", theme.short);
     }
     // The one file `serve` requires. Without it every request falls through to
     // the built-in theme, indistinguishable from the upload having no effect.
     if !staging.join("dist").join("index.html").is_file() {
-        bail!("主题包里没有 dist/index.html");
+        refuse!("主题包里没有 dist/index.html");
     }
 
     let destination = themes.join(&theme.short);
@@ -386,14 +455,15 @@ const PREVIEW: &str = "preview.png";
 /// request, the same path a broken theme already takes.
 pub fn remove(themes: &Path, short: &str) -> Result<()> {
     if !valid_short(short) {
-        bail!("没有这个主题");
+        refuse!("没有这个主题");
     }
     let base = themes.canonicalize()?;
-    let root = base.join(short).canonicalize()?;
+    // Already gone, as when two panels delete the same theme.
+    let Ok(root) = base.join(short).canonicalize() else { refuse!("没有这个主题") };
     // Canonical on both sides: a symlink leading out of the themes directory
     // must not be deleted through.
     if !root.starts_with(&base) || !root.is_dir() {
-        bail!("没有这个主题");
+        refuse!("没有这个主题");
     }
     fs::remove_dir_all(root)?;
     Ok(())
@@ -483,17 +553,76 @@ mod tests {
         assert_eq!(fs::read(base.join("aurora/dist/index.html")).unwrap(), b"v3");
         assert!(!base.join("aurora/dist/old.js").exists(), "the replaced theme must not leave files behind");
 
-        // A theme the hub cannot serve, a name that cannot be a directory, and
-        // a symlink -- the entry type that writes where the path check cannot
-        // look.
+        // A file where a directory must go, a theme the hub cannot serve, a name
+        // that cannot be a directory, and a symlink -- the entry type that
+        // writes where the path check cannot look.
         for bad in [
+            pack(&[("theme.json", manifest), ("dist", b"x"), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest)], None),
             pack(&[("theme.json", r#"{"name":"x","short":"../evil","description":"","version":"1","author":"a","url":""}"#.as_bytes()), ("dist/index.html", b"x")], None),
             pack(&[("theme.json", manifest), ("dist/index.html", b"x")], Some(("dist/link", "/etc/passwd"))),
             pack(&[("dist/index.html", b"x")], None),
         ] {
-            assert!(install(&base, bad, None).is_err());
+            // A reason for the panel, never the 500 of a failure on this machine.
+            let Err(e) = install(&base, bad, None) else { panic!("a bad package installed") };
+            assert!(e.downcast_ref::<crate::Shown>().is_some(), "{e:#}");
         }
+        // A download cut short says so, rather than quoting the decoder.
+        pack(&[("theme.json", manifest), ("dist/index.html", b"v9")], None);
+        let whole = fs::read(&archive).unwrap();
+        let Err(e) = install(&base, &whole[..whole.len() / 2], None) else {
+            panic!("half an archive installed")
+        };
+        assert_eq!(e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()), Some(DAMAGED), "{e:#}");
+        // Cut past tar's end marker, or with one byte changed on the way: every
+        // header reads, so only the gzip checksum can refuse either.
+        let mut altered = whole.clone();
+        let crc = altered.len() - 8;
+        altered[crc] ^= 1;
+        for damaged in [&whole[..whole.len() - 4], &altered[..]] {
+            let Err(e) = install(&base, damaged, None) else { panic!("a damaged archive installed") };
+            assert_eq!(e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()), Some(DAMAGED), "{e:#}");
+        }
+        // The wrong file rather than a damaged one: a zip, or the same tar
+        // already decompressed. Downloading it again cannot help, so the answer
+        // names the right file instead.
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(&whole[..]).read_to_end(&mut plain).unwrap();
+        for wrong in [&b"PK\x03\x04"[..], &plain[..]] {
+            let Err(e) = install(&base, wrong, None) else { panic!("a file that is not gzip installed") };
+            assert_eq!(e.downcast_ref::<crate::Shown>().map(|s| s.0.as_str()), Some(NOT_GZIP), "{e:#}");
+        }
+        // Source code (tar.gz): a pax global header, then the repository one
+        // directory down. It reaches the missing manifest, which names the file.
+        let mut source =
+            tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::XGlobalHeader);
+        header.set_size(6);
+        header.set_mode(0o644);
+        source.append_data(&mut header, "pax_global_header", &b"6 a=b\n"[..]).unwrap();
+        for (name, data) in [("aurora-1/theme.json", manifest), ("aurora-1/dist/index.html", b"v9")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            source.append_data(&mut header, name, data).unwrap();
+        }
+        let source = source.into_inner().unwrap().finish().unwrap();
+        let Err(e) = install(&base, &source[..], None) else { panic!("a source archive installed") };
+        assert!(e.to_string().contains("Source code"), "{e:#}");
+        // Past the end marker, padding and nothing more.
+        let mut padded = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        padded.append_data(&mut header, "theme.json", &b"{}"[..]).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &padded.into_inner().unwrap()).unwrap();
+        std::io::Write::write_all(&mut gz, &vec![0; (MAX_PADDING + 1) as usize]).unwrap();
+        let Err(e) = install(&base, &gz.finish().unwrap()[..], None) else {
+            panic!("an oversized tail installed")
+        };
+        assert!(e.to_string().contains("tar 结尾之后"), "{e:#}");
 
         // None of that affected the theme being served or left a staging
         // directory behind.

@@ -39,9 +39,14 @@
   --chart-5: oklch(0.769 0.188 70.08);
   --ok: oklch(0.63 0.17 149);
   --warn: oklch(0.75 0.17 70);
+  --near: oklch(0.575 0.12 55);
+  --over: oklch(0.5 0.14 27);
 }
 
+/* `color-scheme` draws the browser's own controls -- the date picker icon,
+   number spinners, checkboxes, scrollbars -- in the dark palette as well. */
 .dark {
+  color-scheme: dark;
   --background: oklch(0.129 0.042 264.695);
   --foreground: oklch(0.984 0.003 247.858);
   --card: oklch(0.208 0.042 265.755);
@@ -67,6 +72,8 @@
   --chart-5: oklch(0.645 0.246 16.439);
   --ok: oklch(0.7 0.16 150);
   --warn: oklch(0.8 0.16 75);
+  --near: oklch(0.8 0.1 65);
+  --over: oklch(0.7 0.11 25);
 }
 
 @theme inline {
@@ -99,6 +106,8 @@
   --color-chart-5: var(--chart-5);
   --color-ok: var(--ok);
   --color-warn: var(--warn);
+  --color-near: var(--near);
+  --color-over: var(--over);
 }
 
 @layer base {
@@ -106,6 +115,15 @@
   /* Reserve the scrollbar's width on every page: without it, leaving a route
      whose content exceeds the fold widens the page. */
   html { scrollbar-gutter: stable; }
+  /* A dialog or an open select locks the page, and the lock's stylesheet also
+     hides the scrollbar and pads the body by its width -- both of which the
+     gutter above already provides for. Undone together: the margin would count
+     the width twice and shift the page half a scrollbar left, and the hidden bar
+     would leave the gutter empty, flashing off and on at every open. Scrolling
+     stays locked, since the lock also swallows wheel and touch outside the
+     layer; only a drag on the bar itself still moves the page. The rule is
+     injected at run time with equal specificity, hence the extra `html`. */
+  html body[data-scroll-locked] { margin-right: 0 !important; overflow: visible !important; }
   body { @apply bg-background text-foreground; }
   /* Tailwind v4 leaves `button` and `input` on the browser's default cursor,
      where v3 made buttons a pointer. Radix renders Switch as a button, so without
@@ -116,19 +134,3 @@
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
-
-/* Reordering animates the rows themselves; the rest of the page swaps. */
-::view-transition-old(root),
-::view-transition-new(root) {
-  animation: none;
-}
-
-::view-transition-group(*) {
-  animation-duration: 150ms;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  ::view-transition-group(*) {
-    animation: none;
-  }
-}

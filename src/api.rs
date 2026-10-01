@@ -9,16 +9,16 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{Local, Utc};
+use chrono::{Local, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::agent_ws::Agent;
 use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
-use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::db::{self, Db, Node, NodePatch, PingTask, Traffic, TrafficPatch};
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -26,35 +26,88 @@ use crate::{agent_ws, App, Shared};
 pub struct Admin;
 
 impl FromRequestParts<Shared> for Admin {
-    type Rejection = StatusCode;
+    type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, app: &Shared) -> Result<Self, Self::Rejection> {
         if authed(app, &parts.headers) {
             Ok(Admin)
         } else {
-            Err(StatusCode::UNAUTHORIZED)
+            Err(answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录"))
         }
     }
 }
 
-fn fail(e: impl std::fmt::Display) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+/// Marks a response whose text was written for the reader; see [`plain_errors`].
+#[derive(Clone)]
+struct Written;
+
+/// An error response carrying `text` as written. Every error the hub composes
+/// is built here.
+pub(crate) fn answer(status: StatusCode, text: impl Into<String>) -> Response {
+    let mut response = (status, text.into()).into_response();
+    response.extensions_mut().insert(Written);
+    response
+}
+
+/// What a failure this hub cannot explain to the reader says instead.
+pub(crate) const INTERNAL: &str = "hub 内部出错，详细原因见 hub 日志";
+
+/// Answers an error: 400 with the outermost [`crate::Shown`] message in its
+/// chain, or, without one, 500 with [`INTERNAL`]. The chain is logged in full
+/// either way, the underlying cause of a shown message included.
+pub(crate) fn fail(e: impl Into<anyhow::Error>) -> Response {
+    let e = e.into();
+    match e.downcast_ref::<crate::Shown>() {
+        Some(shown) => {
+            info!("request refused: {e:#}");
+            answer(StatusCode::BAD_REQUEST, shown.0.clone())
+        }
+        None => {
+            warn!("request failed: {e:#}");
+            answer(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL)
+        }
+    }
 }
 
 fn bad(message: &str) -> Response {
-    (StatusCode::BAD_REQUEST, message.to_owned()).into_response()
+    answer(StatusCode::BAD_REQUEST, message)
 }
 
 fn no_such_node() -> Response {
-    (StatusCode::NOT_FOUND, "no such node").into_response()
+    answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除")
+}
+
+/// The last step of every response. An error the hub composed passes as it is;
+/// any other -- an extractor's rejection, the body limit's 413, a bare status --
+/// would carry axum's English wording or nothing, and is given a fixed text for
+/// its status instead.
+pub async fn plain_errors(response: Response) -> Response {
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error())
+        || response.extensions().get::<Written>().is_some()
+    {
+        return response;
+    }
+    let text = match status {
+        StatusCode::UNAUTHORIZED => "登录已失效，请重新登录",
+        StatusCode::NOT_FOUND => "请求的内容不存在",
+        StatusCode::PAYLOAD_TOO_LARGE => "提交的内容过大",
+        s if s.is_server_error() => INTERNAL,
+        _ => "请求格式不对",
+    };
+    // Only the body is replaced: a 405 keeps its `Allow`, for one.
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/plain; charset=utf-8"));
+    Response::from_parts(parts, text.into())
 }
 
 // ---- read paths, shared between the panel and the public page ----
 
-/// Everything a report may expose under `metrics` on the public page: the agent
-/// contract minus the raw kernel counters, which are a wire-protocol detail
-/// disclosing a machine's entire lifetime traffic, plus the four figures the hub
-/// folds in itself. The panel sees the report as it arrived.
+/// Everything a report may expose under `metrics`: the agent contract minus the
+/// raw kernel counters, which are a wire-protocol detail disclosing a machine's
+/// entire lifetime traffic, plus the four traffic figures `node_view` fills in.
+/// The panel additionally sees `iface`.
 pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "uptime",
     "cpu",
@@ -76,20 +129,64 @@ pub(crate) const PUBLIC_METRICS: [&str; 18] = [
     "month_tx",
 ];
 
+/// The addresses the panel shows for a node, each with where it comes from: at
+/// most one per family, v4 first, the one the machine is reached by. The agent
+/// reports its interfaces; `ip` is where its connection arrived from, in dotted
+/// form for IPv4.
+///
+/// Per family an address set by hand comes first, then a public one on the
+/// interface. Failing both, where the interface holds only a private address of
+/// the family the connection used -- NAT, or a proxy in front -- the
+/// connection's public address, its exit, stands in. An exit in a family the
+/// interface does not hold is a translator such as NAT64 or WARP and is left
+/// out.
+///
+/// Private addresses appear only when nothing public is known, as where hub and
+/// node share a network and they are all there is. `ip` alone is the fallback
+/// for an agent reporting no interface.
+fn addresses<'a>(
+    ip: &'a str,
+    (ipv4, ipv6): (&'a str, &'a str),
+    (pin4, pin6): (&'a str, &'a str),
+) -> Vec<(&'a str, &'static str)> {
+    let public =
+        |a: &str, v6: bool| a.parse::<IpAddr>().is_ok_and(|a| a.is_ipv6() == v6 && agent_ws::public(a));
+    let family = |pin: &'a str, held: &'a str, v6: bool| {
+        if !pin.is_empty() {
+            Some((pin, "manual"))
+        } else if public(held, v6) {
+            Some((held, "interface"))
+        } else if !held.is_empty() && public(ip, v6) {
+            Some((ip, "exit"))
+        } else {
+            None
+        }
+    };
+    let shown: Vec<_> = [family(pin4, ipv4, false), family(pin6, ipv6, true)].into_iter().flatten().collect();
+    if !shown.is_empty() {
+        return shown;
+    }
+    let held: Vec<_> = [ipv4, ipv6].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "interface")).collect();
+    if !held.is_empty() {
+        return held;
+    }
+    [ip].into_iter().filter(|a| !a.is_empty()).map(|a| (a, "connection")).collect()
+}
+
 /// One node as the UI consumes it: stored config, live metrics and the hub's
 /// accumulated traffic in a single object.
-fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool) -> Value {
-    // The three capacities arrive twice: once in `Facts`, sent at the handshake
-    // and stored, and again in every `Metrics`. A machine that gains a disk while
-    // the agent is running -- the agent re-reads its mount table every sample so
-    // that it appears -- then has a stored figure that is stale until the next
-    // reconnect, possibly days away. Using the report while a node is connected
+fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool, today: NaiveDate) -> Value {
+    // The three capacities arrive twice: once in `Facts`, sent at the handshake,
+    // and again in every `Metrics`. The stored figure follows the reports a
+    // minute at a time and as the session ends, so it lags a disk mounted while
+    // the agent runs -- the agent re-reads its mount table every sample so that
+    // it appears -- by up to a minute. Using the report while a node is connected
     // keeps every consumer of this view on one number: the card reads the live
     // metrics and the detail page reads these, and they previously showed the
-    // same machine two different capacities. Offline, the stored figure is all
-    // there is. No floor is applied: a host whose swap has just been disabled
-    // reports zero and means it. A node connected but not yet reporting holds
-    // `Null`, where `get` returns nothing and the stored figure stands.
+    // same machine two different capacities. Offline, the stored figure is the
+    // last one reported. No floor is applied: a host whose swap has just been
+    // disabled reports zero and means it. A node connected but not yet reporting
+    // holds `Null`, where `get` returns nothing and the stored figure stands.
     let live = |key: &str, stored: i64| {
         current.and_then(|a| a.metrics.get(key).and_then(serde_json::Value::as_i64)).unwrap_or(stored)
     };
@@ -100,6 +197,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // in, which is what a status page conveys, without locating it. The
         // address it was derived from remains behind the panel.
         "country": if node.country_pin.is_empty() { &node.country } else { &node.country_pin },
+        // Named by the operator for the status page to divide the list by, so
+        // public like the node's name. Empty is ungrouped.
+        "group": node.group,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -122,6 +222,11 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "currency": node.currency,
         "billing_cycle": node.billing_cycle,
         "expires_at": node.expires_at,
+        // Counted on the hub's calendar, the one renewal follows. A page counting
+        // on the visitor's clock would, with the hub on UTC and the visitor on
+        // UTC+8, show every online node expired for eight hours each cycle
+        // before the hub rolls its date forward.
+        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - today).num_days()),
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -136,23 +241,49 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "day_rx": traffic.day_rx,
         "day_tx": traffic.day_tx,
     });
-    // An allowlist rather than a denylist: the agent ships from its own
-    // repository, so a field added there would otherwise reach anonymous visitors
-    // the day it is released. No address, hostname or note may ever do so.
-    if !full {
-        if let Some(m) = view["metrics"].as_object_mut() {
-            m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()));
+    // An allowlist rather than a denylist, for the panel as well: the agent ships
+    // from its own repository, so a field added there would otherwise reach
+    // anonymous visitors the day it is released, and a node token in the wrong
+    // hands could fill the panel's frame with whatever it sends. No address,
+    // hostname or note may ever reach a visitor.
+    if let Some(m) = view["metrics"].as_object_mut() {
+        m.retain(|k, _| PUBLIC_METRICS.contains(&k.as_str()) || (full && k == "iface"));
+        // The same figures as the top-level ones, from the same row. Both official
+        // themes refuse a node's live view without them.
+        for (key, value) in agent_ws::INJECTED.into_iter().zip([
+            traffic.total_rx,
+            traffic.total_tx,
+            traffic.month_rx,
+            traffic.month_tx,
+        ]) {
+            m.insert(key.into(), json!(value));
         }
     }
     // Address, private notes and the token never leave the panel. The token is
     // included so the install command can be displayed without reissuing it.
     if full {
+        let held = (node.ipv4.as_str(), node.ipv6.as_str());
+        let (pin4, pin6) = (node.ipv4_pin.as_str(), node.ipv6_pin.as_str());
+        let shown = addresses(&node.ip, held, (pin4, pin6));
+        // What each family shows with its own pin cleared and the other's kept,
+        // for the edit form to offer as the fallback.
+        let auto = |pins, v6: bool| {
+            addresses(&node.ip, held, pins)
+                .into_iter()
+                .find(|(a, _)| a.contains(':') == v6)
+                .map_or("", |(a, _)| a)
+        };
         view["hostname"] = json!(node.hostname);
         view["ip"] = json!(node.ip);
         view["ipv4"] = json!(node.ipv4);
         view["ipv6"] = json!(node.ipv6);
         view["ipv4_pin"] = json!(node.ipv4_pin);
         view["ipv6_pin"] = json!(node.ipv6_pin);
+        view["addresses"] =
+            shown.iter().map(|(address, source)| json!({"address": address, "source": source})).collect();
+        view["ipv4_auto"] = json!(auto(("", pin6), false));
+        view["ipv6_auto"] = json!(auto((pin4, ""), true));
+        view["interval"] = json!(current.and_then(Agent::interval));
         view["country_pin"] = json!(node.country_pin);
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
@@ -169,17 +300,18 @@ fn visible_nodes(app: &App, full: bool) -> Result<Vec<Value>, anyhow::Error> {
     let traffic = app.db.all_traffic();
     let agents = app.agents.read().unwrap_or_else(|e| e.into_inner());
     let none = Traffic::default();
+    let today = Local::now().date_naive();
     Ok(nodes
         .iter()
         .filter(|n| full || n.public)
-        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full))
+        .map(|n| node_view(n, agents.get(&n.id), traffic.get(&n.id).unwrap_or(&none), full, today))
         .collect())
 }
 
 pub async fn nodes(State(app): State<Shared>, headers: HeaderMap) -> Response {
     let full = authed(&app, &headers);
     if !full && !app.public_page() {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     // The same rendered frame the browser streams receive, for the same reason:
     // otherwise every visitor would rebuild every node's row against the
@@ -206,13 +338,13 @@ fn default_hours() -> i64 {
 
 /// How many history windows are built concurrently.
 ///
-/// `PUBLIC_HOURS` bounds what one request costs; this bounds how many may run,
+/// `span` bounds what one request costs; this bounds how many may run,
 /// closing the same gap `main::RELAY_GATE` and `auth::PASSWORD_GATE` close on
 /// the other two paths an anonymous caller can make expensive. This is the most
 /// expensive of the three: every request holds the single connection the agents
 /// report through for its entire scan, measured at 118 ms for a week of four
-/// probes and growing with `retention_days`. Without a gate, 120 requests from
-/// one machine took the panel's own node list from 1 ms to 2.8 s.
+/// probes, the most minute rows any window reads. Without a gate, 120 requests
+/// from one machine took the panel's own node list from 1 ms to 2.8 s.
 ///
 /// Four, because the requests serialise on that one connection regardless: a
 /// fifth in flight buys no throughput and merely places another scan ahead of
@@ -244,17 +376,15 @@ pub async fn metrics(
 ) -> Response {
     let full = authed(&app, &headers);
     if !readable(&app, full, id) {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     // After the two point lookups above, so an unauthorised caller is told so
     // rather than asked to retry later.
     let Ok(_permit) = HISTORY_GATE.try_acquire() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many history queries in flight, try again")
-            .into_response();
+        return answer(StatusCode::SERVICE_UNAVAILABLE, "查询历史的请求太多，稍后再试");
     };
-    let hours = w.hours.clamp(1, if full { ADMIN_HOURS } else { PUBLIC_HOURS });
-    let since = Utc::now().timestamp() - hours * 3_600;
-    let step = sample_step(hours, w.points);
+    let hours = w.hours.clamp(1, app.db.retention_days() * 24);
+    let span = span(hours, w.points, Utc::now().timestamp());
     let wants = |name: &str| w.series.as_deref().is_none_or(|s| s == name);
     let (want_metrics, want_ping) = (wants("metrics"), wants("ping"));
     // Off the runtime, for the reason given in `db_stats` below: this reads every
@@ -272,15 +402,14 @@ pub async fn metrics(
         // has nothing to label and this costs a turn at the write connection.
         let probes =
             if want_ping { app.db.ping_task_names(id).unwrap_or_else(|_| json!({})) } else { json!({}) };
-        let metrics = if want_metrics { app.db.metrics(id, since, step)? } else { vec![] };
+        let metrics = if want_metrics { app.db.metrics(id, span)? } else { vec![] };
         // `loss` is per probe across the whole window, alongside the per-bucket
         // `loss` on the rows. Both are required and neither replaces the other:
         // the row figure is what a tooltip reads, while the window figure is the
         // only one that can be accurate, since the denominators it divides by are
         // gone by the time the rows are built. Additive, so a theme unaware of it
         // continues to work.
-        let (ping, loss) =
-            if want_ping { app.db.ping_records(id, since, step)? } else { (vec![], json!({})) };
+        let (ping, loss) = if want_ping { app.db.ping_records(id, span)? } else { (vec![], json!({})) };
         anyhow::Ok(json!({"metrics": metrics, "ping": ping, "probes": probes, "loss": loss}))
     })
     .await;
@@ -290,40 +419,39 @@ pub async fn metrics(
     }
 }
 
-/// Widest history window each audience may request.
+/// The window a chart request is answered with, `hours` wide.
 ///
-/// The thinning below bounds the response, not the scan behind it: `hours=2160`
-/// returns 320 rows after reading every probe result the node has retained. At a
-/// month of retention that is 224 ms holding the single write connection the
-/// agents report through, growing with `retention_days`.
-///
-/// The public ceiling is a week because that is the widest chart the themes
-/// draw, so nothing in use is lost. The panel retains the quarter year, being
-/// one signed-in operator rather than an anonymous caller.
-const PUBLIC_HOURS: i64 = 24 * 7;
-const ADMIN_HOURS: i64 = 24 * 90;
-
-/// Seconds between the samples a window is drawn from.
+/// The width is capped by the retention window alone, the same for every
+/// caller, because no width costs more than the week: up to `DETAIL_DAYS` a
+/// request reads minute rows, 10,080 per series at most, and past it hourly
+/// rows, 8,760 per series at a year, with the minute rows not yet folded, which
+/// `Db::metrics` bounds to the newest week. The scan is what a request costs --
+/// the thinning below bounds the response, not the rows read -- so a width
+/// reading more than the week would need a lower ceiling for anonymous callers.
 ///
 /// Thinning exists for what the screen cannot draw rather than as a convention:
 /// where the samples fit, every one is sent. A chart of a hundred points reads
 /// as a hundred samples taken, which for a probe is a claim about the network.
-/// Whole minutes, matching the grid the metric rows sit on.
+/// Whole minutes, matching the grid the metric rows sit on, and whole hours
+/// past the week, so that no hourly row straddles two points.
 ///
 /// `points` is what the caller reports it can draw, and can only lower the
 /// budget: `SAMPLES` is the hub's ceiling rather than the caller's, set at a day
-/// of minutes so the widest charted probe window returns intact.
+/// of minutes so the day's probe window returns intact.
 // ponytail: the budget is per series, so a response is SAMPLES × (1 + probes) --
 // bounded by how many probes the admin created, not by the caller. Four probes
 // at a day is ~90 kB gzipped; if that list ever grows long, scale SAMPLES by
 // the probe count.
-fn sample_step(hours: i64, points: Option<i64>) -> i64 {
+fn span(hours: i64, points: Option<i64>, now: i64) -> db::Span {
     const SAMPLES: i64 = 1_440;
     let budget = points.unwrap_or(SAMPLES).clamp(60, SAMPLES);
+    let hourly = hours > db::DETAIL_DAYS * 24;
+    let unit = if hourly { 3_600 } else { 60 };
     // Rounded up, or the budget would not be one: a window that does not divide
     // evenly would keep the finer step and exceed it. `i64::div_ceil` is still
     // unstable, and both operands are positive here.
-    60 * ((hours * 60 + budget - 1) / budget).max(1)
+    let step = unit * ((hours * 3_600 / unit + budget - 1) / budget).max(1);
+    db::Span { since: now - hours * 3_600, step, hourly }
 }
 
 /// Guards a per-node read: the panel sees everything, while the public page sees
@@ -408,7 +536,7 @@ pub async fn live_ws(State(app): State<Shared>, headers: HeaderMap, upgrade: Web
     // running, and only the row it names can report whether it has.
     let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
     if session.is_none() && !app.public_page() {
-        return (StatusCode::UNAUTHORIZED, "sign-in required").into_response();
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
     upgrade
         .read_buffer_size(SOCKET_BUFFER)
@@ -527,12 +655,67 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
 /// only because `period_start` clamps what it reads.
 fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -> Option<&'static str> {
     if reset_day.is_some_and(|d| !(1..=31).contains(&d)) {
-        return Some("reset day must be from 1 to 31");
+        return Some("流量重置日要在 1 到 31 之间");
     }
     if price.is_some_and(|v| !v.is_finite() || v < 0.0) || limit.is_some_and(|v| v < 0) {
-        return Some("price and traffic limit must be non-negative");
+        return Some("价格和流量上限不能是负数");
     }
     None
+}
+
+/// A theme shows the group as a tab label or a section title, so it is held to a
+/// length that fits one line on a 390 px phone.
+const MAX_GROUP: usize = 13;
+
+/// Trims a group name, or refuses it. Refused rather than truncated: the panel
+/// would otherwise report saved a name that is not the one stored.
+fn group_error(group: &mut String) -> Option<&'static str> {
+    *group = group.trim().to_owned();
+    if group.chars().count() > MAX_GROUP || group.chars().any(char::is_control) {
+        return Some("分组名最多 13 个字，不能含控制字符");
+    }
+    None
+}
+
+/// Normalizes the currency and billing cycle, or names the one that cannot be
+/// stored. The currency is held to the ISO 4217 form of three letters, the only
+/// one `Intl.NumberFormat` accepts, so a theme may pass it on without guarding
+/// against a throw. Each cycle length is stored in a single spelling, see
+/// `cycle_name`.
+fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> Option<&'static str> {
+    if let Some(code) = currency {
+        *code = code.trim().to_ascii_uppercase();
+        if !(code.len() == 3 && code.bytes().all(|b| b.is_ascii_uppercase())) {
+            return Some("货币要填三个字母的代码，如 USD、CNY、HKD");
+        }
+    }
+    if let Some(cycle) = cycle.filter(|c| *c != "once") {
+        let Some(months) = crate::cycle_months(cycle) else {
+            return Some("付款周期要是整月，在 1 个月到 100 年之间");
+        };
+        *cycle = crate::cycle_name(months);
+    }
+    None
+}
+
+/// Normalizes a patch, or names the first value that cannot be stored. The one
+/// check both the single and the batch write pass through, so the two accept
+/// exactly the same values.
+fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
+    if let Some(name) = &mut node.name {
+        *name = name.trim().to_owned();
+        if name.is_empty() {
+            return Some("请填写节点名称");
+        }
+    }
+    if let Some(group) = &mut node.group {
+        if let Some(message) = group_error(group) {
+            return Some(message);
+        }
+    }
+    node_limits(node.traffic_reset_day, node.price, node.traffic_limit)
+        .or_else(|| billing_error(node.currency.as_mut(), node.billing_cycle.as_mut()))
+        .or_else(|| pins(node))
 }
 
 /// Normalizes the values set by hand, or names the one that cannot stand. Each
@@ -544,7 +727,7 @@ fn pins(node: &mut NodePatch) -> Option<&'static str> {
     if let Some(cc) = &mut node.country_pin {
         *cc = cc.trim().to_ascii_uppercase();
         if !cc.is_empty() && !(cc.len() == 2 && cc.bytes().all(|b| b.is_ascii_uppercase())) {
-            return Some("country must be two letters, or empty to look it up");
+            return Some("国家要填两个字母的代码，留空则自动识别");
         }
     }
     for (pin, v6) in [(&mut node.ipv4_pin, false), (&mut node.ipv6_pin, true)] {
@@ -558,8 +741,8 @@ fn pins(node: &mut NodePatch) -> Option<&'static str> {
         *pin = match parsed {
             Ok(ip) => ip.to_string(),
             Err(_) if typed.is_empty() => String::new(),
-            Err(_) if v6 => return Some("IPv6 must be an IPv6 address, or empty"),
-            Err(_) => return Some("IPv4 must be an IPv4 address, or empty"),
+            Err(_) if v6 => return Some("IPv6 要填一个 IPv6 地址，或者留空"),
+            Err(_) => return Some("IPv4 要填一个 IPv4 地址，或者留空"),
         };
     }
     None
@@ -571,6 +754,9 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
+        // How far back a chart may reach, so a theme offers only windows the hub
+        // answers in full; `metrics` narrows a wider one without saying so.
+        "history_days": app.db.retention_days(),
         // Whether this browser may provision is not answered here: a GET carries
         // no `Origin`, so the panel applies `provisioning_allowed`'s rule itself.
         //
@@ -590,14 +776,16 @@ pub async fn create_node(
     body: Result<Json<Node>, JsonRejection>,
 ) -> Response {
     if let Err(refusal) = provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, refusal).into_response();
+        return answer(StatusCode::FORBIDDEN, refusal);
     }
-    let Ok(Json(mut node)) = body else { return bad("invalid node") };
+    let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
     if node.name.trim().is_empty() {
-        return bad("name is required");
+        return bad("请填写节点名称");
     }
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
+            .or_else(|| group_error(&mut node.group))
+            .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
     {
         return bad(message);
     }
@@ -670,7 +858,7 @@ pub async fn agent_register(
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
     if app.registrations.locked(ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
+        return answer(StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later");
     }
     // A rerun on a registered machine sends the token it already holds and
     // receives it back while that token still opens a node, so the rerun adds no
@@ -684,14 +872,13 @@ pub async fn agent_register(
             Ok(None) => {}
             // Read as "no node", a failed lookup would register a second node for
             // a machine whose node is intact.
-            Err(e) => return fail(e),
+            Err(e) => return script_fail(e),
         }
     }
     // One answer for both "no window is open" and "that key is wrong": the
     // difference is only useful to someone who has neither.
     let closed = || {
-        (StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
-            .into_response()
+        answer(StatusCode::FORBIDDEN, "registration is closed; open a new window from the panel's node list")
     };
     let until = app.db.get("register_until").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     let Some(key) = app.db.get("register_key").filter(|k| !k.is_empty() && Utc::now().timestamp() < until)
@@ -707,13 +894,12 @@ pub async fn agent_register(
     }
     match app.db.nodes_created_since(until - REGISTER_WINDOW) {
         Ok(n) if n >= REGISTER_LIMIT => {
-            return (
+            return answer(
                 StatusCode::FORBIDDEN,
                 "this window has registered enough nodes; open a new window from the panel's node list",
             )
-                .into_response()
         }
-        Err(e) => return fail(e),
+        Err(e) => return script_fail(e),
         Ok(_) => {}
     }
 
@@ -727,7 +913,7 @@ pub async fn agent_register(
     // and a node registered here must match one added through the panel.
     let node = match serde_json::from_value::<Node>(json!({ "name": name })) {
         Ok(node) => node,
-        Err(e) => return fail(e),
+        Err(e) => return script_fail(e),
     };
     let token = random_token();
     match app.db.create_node(&node, &token) {
@@ -736,15 +922,22 @@ pub async fn agent_register(
             invalidate_snapshot(&app);
             token.into_response()
         }
-        Err(e) => fail(e),
+        Err(e) => script_fail(e),
     }
+}
+
+/// [`fail`] for `install.sh`, whose own output is English and which prints the
+/// reply in one line after its own.
+fn script_fail(e: impl Into<anyhow::Error>) -> Response {
+    warn!("registration failed: {:#}", e.into());
+    answer(StatusCode::INTERNAL_SERVER_ERROR, "the hub hit an internal error; its log has the details")
 }
 
 /// Opens a registration window with a fresh key. Any previous key stops working
 /// the moment this returns.
 pub async fn open_register(_: Admin, State(app): State<Shared>, headers: HeaderMap) -> Response {
     if let Err(refusal) = provisioning_allowed(&app, &headers) {
-        return (StatusCode::FORBIDDEN, refusal).into_response();
+        return answer(StatusCode::FORBIDDEN, refusal);
     }
     let key = random_token();
     let until = (Utc::now().timestamp() + REGISTER_WINDOW).to_string();
@@ -768,17 +961,8 @@ pub async fn update_node(
     Path(id): Path<i64>,
     body: Result<Json<NodePatch>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(mut node)) = body else { return bad("invalid node") };
-    if let Some(name) = &mut node.name {
-        *name = name.trim().to_owned();
-        if name.is_empty() {
-            return bad("name is required");
-        }
-    }
-    if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
-        return bad(message);
-    }
-    if let Some(message) = pins(&mut node) {
+    let Ok(Json(mut node)) = body else { return bad("节点数据格式不对") };
+    if let Some(message) = patch_error(&mut node) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -791,22 +975,66 @@ pub async fn update_node(
     }
 }
 
+/// What a batch may set: the settings the panel applies across a selection.
+/// An allowlist, so a field added to [`NodePatch`] later, possibly one that
+/// describes a single machine, is refused here until it is listed.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BatchPatch {
+    group: Option<String>,
+    notify: Option<bool>,
+}
+
 #[derive(Deserialize)]
-pub struct NodeOrder {
+pub struct NodeBatch {
+    ids: Vec<i64>,
+    #[serde(default)]
+    patch: BatchPatch,
+}
+
+/// Applies one patch to every selected node, all or none.
+pub async fn update_nodes(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<NodeBatch>, JsonRejection>,
+) -> Response {
+    let Ok(Json(NodeBatch { mut ids, patch })) = body else {
+        return bad("批量修改只支持分组和通知");
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return bad("没有选中节点");
+    }
+    let mut patch = NodePatch { group: patch.group, notify: patch.notify, ..Default::default() };
+    if let Some(message) = patch_error(&mut patch) {
+        return bad(message);
+    }
+    match app.db.update_nodes(&ids, &patch) {
+        Ok(true) => {
+            invalidate_snapshot(&app);
+            Json(json!({"updated": ids.len()})).into_response()
+        }
+        Ok(false) => answer(StatusCode::NOT_FOUND, "有节点已被删除，没有做任何修改；刷新后重新选择"),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Order {
     ids: Vec<i64>,
 }
 
 /// The list must name every node exactly once, checked inside the transaction
 /// that renumbers rather than here: re-reading the node list first would only
 /// race the write it guards.
-pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
+pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
     match app.db.reorder_nodes(&order.ids) {
         Ok(()) => {
             invalidate_snapshot(&app);
             Json(json!({"ok": true})).into_response()
         }
-        // Every failure here indicates a malformed list from the caller.
-        Err(e) => bad(&e.to_string()),
+        Err(e) => fail(e),
     }
 }
 
@@ -823,6 +1051,9 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     // metrics. Dropped after the delete, so the reconnect that follows finds no
     // token to accept. The same reasoning applies in `reset_token` below.
     app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    // Its held reading as well, which would otherwise be booked into the node
+    // that inherits the id.
+    app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
 }
@@ -858,7 +1089,7 @@ pub async fn patch_traffic(
     Json(p): Json<TrafficPatch>,
 ) -> Response {
     if [p.total_rx, p.total_tx, p.month_rx, p.month_tx].into_iter().flatten().any(|v| v < 0) {
-        return bad("traffic must be non-negative");
+        return bad("流量不能是负数");
     }
     match app.db.set_traffic(id, &p) {
         Ok(true) => {
@@ -873,6 +1104,15 @@ pub async fn patch_traffic(
 pub async fn ping_tasks(_: Admin, State(app): State<Shared>) -> Response {
     match app.db.ping_tasks() {
         Ok(tasks) => Json(json!({"tasks": tasks})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// As `reorder_nodes`. Nothing is pushed to the agents: the list they run is in
+/// id order, see `ping_tasks_for`.
+pub async fn reorder_ping_tasks(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
+    match app.db.reorder_ping_tasks(&order.ids) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -910,12 +1150,12 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     task.name = task.name.trim().to_owned();
     task.target = task.target.trim().to_owned();
     if task.name.is_empty() || task.target.is_empty() {
-        return bad("name and target are required");
+        return bad("请填写名称和目标");
     }
     // A TCP probe requires an explicit port; a bare host would silently never
     // connect.
     if !valid_target(&task.target) {
-        return bad("target must be host:port, for example 1.1.1.1:443 or [2606:4700:4700::1111]:443");
+        return bad("目标要写成「主机:端口」，例如 1.1.1.1:443 或 [2606:4700:4700::1111]:443");
     }
     // Refused rather than clamped, for the reason `setting_error` gives for
     // `retention_days`: the agent clamps this again on arrival, so an
@@ -924,18 +1164,15 @@ pub async fn save_ping_task(_: Admin, State(app): State<Shared>, Json(mut task):
     // number is 5 seconds, the fastest probe available, run by every node the
     // task is assigned to; the panel reaches 0 simply by having its interval
     // field cleared.
-    if !(5..=3_600).contains(&task.interval) {
-        return bad("interval must be from 5 to 3600 seconds");
+    if !(Db::MIN_PROBE_INTERVAL..=3_600).contains(&task.interval) {
+        return bad(&format!("间隔要在 {} 到 3600 秒之间", Db::MIN_PROBE_INTERVAL));
     }
     match app.db.save_ping_task(&task) {
         Ok(id) => {
             agent_ws::push_ping_tasks(&app);
             Json(json!({"id": id})).into_response()
         }
-        // Every failure here originates with the caller: a node id that does not
-        // exist, or more probes on one node than the agent will run. The same
-        // reasoning as `reorder_nodes`.
-        Err(e) => bad(&e.to_string()),
+        Err(e) => fail(e),
     }
 }
 
@@ -959,6 +1196,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    "update_notice",
 ];
 
 // ---- the database itself ----
@@ -977,12 +1215,14 @@ pub const MAX_CHUNK: usize = 8 * 1024 * 1024;
 /// the first request rather than by counting bytes as they arrive, so an
 /// oversized upload is refused before a byte is sent.
 ///
-/// The backup ceiling is set where it is because restoring holds the connection
-/// every read and write passes through: at the measured ~40 MB/s that is roughly
-/// 6.5 seconds during which the panel and the public page also wait. Database
-/// sizes reachable with a few hundred nodes sit two orders of magnitude below
-/// it.
-pub const MAX_RESTORE: u64 = 256 * 1024 * 1024;
+/// The backup ceiling bounds how long a restore holds the connection every read
+/// and write passes through, while the panel and the public page wait and the
+/// agents' reports queue: a 1.5 GiB copy measured 20.5 s from the page cache, so
+/// 1 GiB is 14 s, or 27 s at the ~40 MB/s measured from disk -- within the 90 s
+/// an agent waits before reconnecting. It clears what history can reach: at 300
+/// nodes with four probes, a week of minute rows and a year of hourly ones come
+/// to about 720 MiB.
+pub const MAX_RESTORE: u64 = 1024 * 1024 * 1024;
 pub const MAX_THEME: u64 = 32 * 1024 * 1024;
 
 /// One request of an upload: `total` is the whole file, `offset` where this piece
@@ -1009,10 +1249,10 @@ pub struct Chunk {
 /// and would save about a second on a 6.7 MB backup.
 async fn receive(path: &str, chunk: &Chunk, max: u64, body: axum::body::Body) -> Result<u64, anyhow::Error> {
     if chunk.total == 0 || chunk.total > max {
-        anyhow::bail!("文件必须在 1 字节到 {} MiB 之间", max / 1024 / 1024);
+        refuse!("文件必须在 1 字节到 {} MiB 之间", max / 1024 / 1024);
     }
     if chunk.offset > chunk.total {
-        anyhow::bail!("分片位置越过了文件末尾");
+        refuse!("分片位置越过了文件末尾");
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -1028,14 +1268,14 @@ async fn receive(path: &str, chunk: &Chunk, max: u64, body: axum::body::Body) ->
     let mut file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("这次上传已经不在了，请从头开始")
+            refuse!("这次上传已经不在了，请从头开始")
         }
         Err(e) => return Err(e.into()),
     };
 
     let already = file.metadata()?.len();
     if already != chunk.offset {
-        anyhow::bail!("分片接不上：已经收到 {already} 字节，这一片却从 {} 开始", chunk.offset);
+        refuse!("分片接不上：已经收到 {already} 字节，这一片却从 {} 开始", chunk.offset);
     }
 
     match append(&mut file, chunk, body).await {
@@ -1057,6 +1297,7 @@ async fn append(
     chunk: &Chunk,
     body: axum::body::Body,
 ) -> Result<u64, anyhow::Error> {
+    use anyhow::Context;
     use std::io::Write;
     use std::pin::Pin;
 
@@ -1065,10 +1306,11 @@ async fn append(
     while let Some(piece) =
         std::future::poll_fn(|cx| futures_core::Stream::poll_next(Pin::new(&mut stream), cx)).await
     {
-        let piece = piece?;
+        // The client went away mid-piece, as a cancelled upload does.
+        let piece = piece.context(crate::Shown("上传中断了，请重新上传".into()))?;
         received += piece.len() as u64;
         if chunk.offset + received > chunk.total {
-            anyhow::bail!("这一片超出了声明的文件大小");
+            refuse!("这一片超出了声明的文件大小");
         }
         file.write_all(&piece)?;
     }
@@ -1085,8 +1327,8 @@ fn scratch_path(app: &App, kind: &str) -> String {
 /// The data page's figures.
 ///
 /// Off the runtime, like the three routes below: `stats` counts every row of
-/// `metric` and `ping_record` -- both WITHOUT ROWID, so each count is a full
-/// index scan -- holding the connection the agents report through throughout. At
+/// both tiers of history -- all WITHOUT ROWID, so each count is a full index
+/// scan -- holding the connection the agents report through throughout. At
 /// 2.2M rows that is 127 ms during which the public page and every agent report
 /// also wait, growing with `retention_days`.
 pub async fn db_stats(_: Admin, State(app): State<Shared>) -> Response {
@@ -1160,7 +1402,7 @@ pub async fn db_restore(
     let path = format!("{}.upload", app.db.file());
     let received = match receive(&path, &chunk, MAX_RESTORE, body).await {
         Ok(received) => received,
-        Err(e) => return bad(&format!("{e:#}")),
+        Err(e) => return fail(e),
     };
     if received < chunk.total {
         return Json(json!({"received": received})).into_response();
@@ -1183,7 +1425,7 @@ pub async fn db_restore(
     let source = scratch_path(&app, "restoring");
     if let Err(e) = std::fs::rename(&path, &source) {
         let _ = std::fs::remove_file(&path);
-        return bad(&format!("上传收齐了却取不到文件：{e}"));
+        return fail(e);
     }
 
     let outcome = restore(&app, &source).await;
@@ -1200,6 +1442,8 @@ pub async fn db_restore(
             // now belong to different nodes, or to none. Dropping the senders ends
             // those loops; each reconnects against the restored database.
             app.agents.write().unwrap_or_else(|e| e.into_inner()).clear();
+            // Held readings belong to the database just replaced.
+            app.readings.lock().unwrap_or_else(|e| e.into_inner()).clear();
             invalidate_snapshot(&app);
             let cookie = match app.db.drop_all_sessions().and_then(|()| issue_session(&app, &headers)) {
                 Ok(cookie) => cookie,
@@ -1207,13 +1451,13 @@ pub async fn db_restore(
             };
             with_cookies(Json(json!({"ok": true})), [cookie])
         }
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
 async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     // Both halves read the whole file, off the runtime: `PRAGMA integrity_check`
-    // on a 256 MiB upload is not runtime work, and the copy that follows holds
+    // on a 1 GiB upload is not runtime work, and the copy that follows holds
     // the connection the agents write through.
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
@@ -1258,7 +1502,7 @@ pub async fn upload_theme(
     let name = path.to_string_lossy().into_owned();
     let received = match receive(&name, &chunk, MAX_THEME, body).await {
         Ok(received) => received,
-        Err(e) => return bad(&format!("{e:#}")),
+        Err(e) => return fail(e),
     };
     if received < chunk.total {
         return Json(json!({"received": received})).into_response();
@@ -1272,7 +1516,7 @@ pub async fn upload_theme(
     let source = app.themes.join(format!(".installing-{}.tar.gz", &random_token()[..16]));
     if let Err(e) = std::fs::rename(&path, &source) {
         let _ = std::fs::remove_file(&path);
-        return bad(&format!("上传收齐了却取不到文件：{e}"));
+        return fail(e);
     }
 
     // Off the runtime: gunzip plus a few thousand small writes.
@@ -1286,13 +1530,89 @@ pub async fn upload_theme(
     let _ = std::fs::remove_file(&source);
     match installed.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r) {
         Ok(theme) => Json(json!({"theme": theme})).into_response(),
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
 /// The asset a theme repository publishes, and the only name the hub fetches: the
 /// same `theme.tar.gz` the upload button accepts.
 const ARCHIVE: &str = "theme.tar.gz";
+
+/// How long a release lookup stands before the panel asks GitHub again, and how
+/// long a failed one does. The short retry keeps one unreachable moment from
+/// hiding an update for the rest of the day; the long one keeps a panel left
+/// open on a screen to four lookups a day, well inside the 60 per hour an
+/// unauthenticated caller is allowed.
+const RELEASES_FRESH: i64 = 6 * 3600;
+const RELEASES_RETRY: i64 = 600;
+
+/// What is running here, and what is published. The agent's own version travels
+/// in its hello and is already in the node list, so the panel compares the two
+/// itself and names the nodes to upgrade.
+///
+/// Admin-only, and deliberately not part of `/api/me`: that route answers
+/// anonymous callers, to whom the running hub version is not disclosed. Nothing
+/// is fetched until an administrator opens the panel, so a hub whose panel is
+/// never opened makes no outbound request.
+pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    let cached = app.releases.lock().unwrap().clone();
+    let latest = if fresh_enough(&cached, Utc::now().timestamp()) {
+        cached
+    } else {
+        // Both at once: one round trip of latency rather than two, and neither
+        // lookup depends on the other.
+        let (hub, agent) =
+            tokio::join!(latest_tag(&app, crate::HUB_REPO), latest_tag(&app, crate::AGENT_REPO));
+        let read = crate::Releases {
+            read_at: Utc::now().timestamp(),
+            hub: hub.unwrap_or_default(),
+            agent: agent.unwrap_or_default(),
+        };
+        *app.releases.lock().unwrap() = read.clone();
+        read
+    };
+    Json(json!({
+        "hub": env!("CARGO_PKG_VERSION"),
+        // Empty where GitHub could not be reached, which the panel renders as no
+        // update rather than as an error: a hub on a network that cannot reach
+        // github.com is a supported deployment, not a fault to report.
+        "hub_latest": latest.hub,
+        "agent_latest": latest.agent,
+        // Whether the navigation marks an update. It governs the mark alone: the
+        // lookup runs either way, so the update page still answers when opened.
+        "notice": app.db.get("update_notice").as_deref() != Some("off"),
+    }))
+}
+
+/// Whether the cached lookup still answers. One that returned nothing is held
+/// for [`RELEASES_RETRY`] instead, so a single unreachable moment does not hide
+/// an update for the rest of the day.
+fn fresh_enough(cached: &crate::Releases, now: i64) -> bool {
+    let holds =
+        if cached.hub.is_empty() || cached.agent.is_empty() { RELEASES_RETRY } else { RELEASES_FRESH };
+    cached.read_at != 0 && now - cached.read_at < holds
+}
+
+/// The tag of a repository's latest release, without its leading `v`, or None
+/// where GitHub could not be read, which costs only the update notice.
+async fn latest_tag(app: &App, repo: &str) -> Option<String> {
+    let tag = latest_release(app, repo).await.ok()?.tag_name;
+    Some(tag.strip_prefix('v').unwrap_or(&tag).to_owned())
+}
+
+/// The latest release of `owner/repo`. Unauthenticated: 60 requests per hour from
+/// this address. GitHub returns 403 without a User-Agent. Never through the
+/// panel's GitHub proxy, which most mirrors provide for release downloads alone.
+async fn latest_release(app: &App, repo: &str) -> reqwest::Result<Release> {
+    app.http
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        .header(header::USER_AGENT, "monitor-hub")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+}
 
 #[derive(Deserialize)]
 struct Release {
@@ -1306,19 +1626,21 @@ struct Asset {
     name: String,
 }
 
-/// The `<owner>/<repo>` a theme's `url` names, where it names a GitHub repository
-/// at all.
+/// The `<owner>/<repo>` a theme's `url` or an address pasted to install one
+/// names, where it names a GitHub repository at all.
 ///
-/// An allowlist rather than a filter. Every address the update path fetches is
-/// constructed from these two strings, so nothing in a manifest can direct the
-/// hub at a host it did not choose, which is why no private-address check is
-/// needed here. The only host that is not github.com is the GitHub proxy in the
-/// panel's settings, configured by the operator and already used by the agent
-/// relay.
+/// An allowlist rather than a filter. Every address the update and install paths
+/// fetch is constructed from these two strings, so neither a manifest nor a pasted
+/// address can direct the hub at a host it did not choose, which is why no
+/// private-address check is needed here. The only host that is not github.com
+/// is the GitHub proxy in the panel's settings, configured by the operator and
+/// already used by the agent relay.
 fn github_repo(url: &str) -> Option<(&str, &str)> {
     let (owner, rest) = url.strip_prefix("https://github.com/")?.split_once('/')?;
-    // A link to a branch or a file is still a link to the repository.
-    let repo = rest.split('/').next()?;
+    // A link to a branch or a file is still a link to the repository, as is the
+    // `?tab=readme-ov-file` or `#readme` a browser's address bar often carries;
+    // neither part reaches the addresses built from the result.
+    let repo = rest.split(['/', '?', '#']).next()?;
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     (path_segment(owner) && path_segment(repo)).then_some((owner, repo))
 }
@@ -1343,32 +1665,18 @@ fn path_segment(segment: &str) -> bool {
 pub async fn update_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match update(&app, &short).await {
         Ok((updated, version)) => Json(json!({"updated": updated, "version": version})).into_response(),
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
     }
 }
 
 async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error> {
-    use anyhow::{bail, Context};
-
-    let installed = crate::frontend::themes(app)?
-        .into_iter()
-        .find(|theme| theme.short == short)
-        .context("没有这个主题")?;
-    let (owner, repo) = github_repo(&installed.url)
-        .context("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包")?;
-
-    // Unauthenticated: 60 requests per hour from this address, ample for a manual
-    // action. GitHub returns 403 without a User-Agent.
-    let release: Release = app
-        .http
-        .get(format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"))
-        .header(header::USER_AGENT, "monitor-hub")
-        .send()
-        .await?
-        .error_for_status()
-        .with_context(|| format!("读不到 {owner}/{repo} 的最新 release"))?
-        .json()
-        .await?;
+    let Some(installed) = crate::frontend::themes(app)?.into_iter().find(|theme| theme.short == short) else {
+        refuse!("没有这个主题");
+    };
+    let Some((owner, repo)) = github_repo(&installed.url) else {
+        refuse!("这个主题的 url 不是 https://github.com/<owner>/<repo>，只能手动上传新包");
+    };
+    let release = latest_theme(app, owner, repo).await?;
 
     // Tags read `v1.2.3` while manifests carry `1.2.3`. Equal means up to date;
     // anything else is installed, including a deliberate downgrade, since the
@@ -1377,48 +1685,140 @@ async fn update(app: &App, short: &str) -> Result<(bool, String), anyhow::Error>
     if tag.strip_prefix('v').unwrap_or(tag) == installed.version {
         return Ok((false, installed.version));
     }
+    // Constrained to the theme it may replace. The built-in theme has no
+    // directory until this runs: updating it writes one, which then serves in
+    // place of the embedded copy until it is deleted.
+    let theme = fetch_theme(app, owner, repo, &release, Some(short)).await?;
+    Ok((true, theme.version))
+}
+
+/// Installs a theme from the latest release of a GitHub repository the
+/// administrator pastes, in place of downloading its `theme.tar.gz` and
+/// uploading it.
+///
+/// The trust is that of an upload: either way the administrator vouches for the
+/// repository. The address is read as an update reads a manifest's `url`, with
+/// only `<owner>/<repo>` taken from it, so the hub still fetches from no host but
+/// GitHub and the configured proxy.
+pub async fn install_theme(_: Admin, State(app): State<Shared>, Json(body): Json<Repository>) -> Response {
+    let url = body.url.trim();
+    // A bare `github.com/...`, the form addresses are often passed along in.
+    let url = if url.starts_with("github.com/") { format!("https://{url}") } else { url.to_owned() };
+    let Some((owner, repo)) = github_repo(&url) else {
+        return bad("填主题的 GitHub 仓库地址，形如 https://github.com/作者/仓库");
+    };
+    let release = match latest_theme(&app, owner, repo).await {
+        Ok(release) => release,
+        Err(e) => return fail(e),
+    };
+    match fetch_theme(&app, owner, repo, &release, None).await {
+        Ok(theme) => Json(json!({"theme": theme})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Repository {
+    url: String,
+}
+
+/// The latest release of a theme's repository, with GitHub's refusal put into
+/// words the panel can show.
+async fn latest_theme(app: &App, owner: &str, repo: &str) -> Result<Release, anyhow::Error> {
+    use anyhow::Context;
+
+    latest_release(app, &format!("{owner}/{repo}")).await.or_else(|e| {
+        let why = match e.status().map(|s| s.as_u16()) {
+            None if e.is_decode() => "GitHub 的回复无法识别，稍后再试",
+            // A private repository answers the same as a missing one.
+            Some(404) => "仓库不存在，或者还没有正式 release",
+            // Unauthenticated callers get 60 requests an hour per address.
+            Some(403 | 429) => "GitHub 限制了这台机器的请求次数，过一小时再试",
+            Some(_) => "GitHub 接口出错，稍后再试",
+            None => "hub 连不上 api.github.com，检查它的网络",
+        };
+        Err(e).context(crate::Shown(format!("读不到 {owner}/{repo} 的最新 release：{why}")))
+    })
+}
+
+/// Downloads the `theme.tar.gz` of `release` and installs it; `expect` names
+/// the theme it must replace, as for [`crate::frontend::install`].
+async fn fetch_theme(
+    app: &App,
+    owner: &str,
+    repo: &str,
+    release: &Release,
+    expect: Option<&str>,
+) -> Result<crate::frontend::Theme, anyhow::Error> {
+    use anyhow::Context;
+
+    let tag = &release.tag_name;
     if !path_segment(tag) {
-        bail!("release 的 tag {tag:?} 不能出现在下载地址里");
+        refuse!("release 的 tag {tag:?} 不能出现在下载地址里");
     }
     // Checked here rather than by downloading and reading a 404: the asset name is
     // the contract, and stating so is the entire error message.
     if !release.assets.iter().any(|asset| asset.name == ARCHIVE) {
-        bail!("release {tag} 里没有 {ARCHIVE}");
+        refuse!("release {tag} 里没有 {ARCHIVE}");
     }
 
     // Through the panel's GitHub proxy when one is configured, the archive being
-    // the part a blocked network cannot reach. The API call above is not proxied:
-    // most proxies front only releases, and a hub that cannot read the tag still
-    // has the upload path.
-    let url =
-        crate::proxied(app, format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}"));
-    let response =
-        app.http.get(url).timeout(std::time::Duration::from_secs(120)).send().await?.error_for_status()?;
+    // the part a blocked network cannot reach. The API call in `latest_theme` is
+    // not proxied: most proxies front only releases, and a hub that cannot read
+    // the tag still has the upload path.
+    let direct = format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{ARCHIVE}");
+    let url = crate::proxied(app, direct.clone());
+    let proxy = url != direct;
+    let unreachable = || {
+        crate::Shown(if proxy {
+            format!("经 GitHub 代理下载 {ARCHIVE} 失败，换一个代理，或清空代理让 hub 直连")
+        } else {
+            format!("下载 {ARCHIVE} 失败：hub 连不上 github.com 时，在设置里填 GitHub 代理")
+        })
+    };
+    let response = app
+        .http
+        .get(url)
+        // With the release lookup's 15 s, this keeps the request inside the 100 s
+        // Cloudflare waits for an origin before answering 524 itself: a download
+        // too slow to finish is then reported as one, naming the proxy setting,
+        // rather than as a hub that did not respond.
+        .timeout(std::time::Duration::from_secs(75))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(unreachable)?;
     // The transfer stops at Content-Length, so checking it checks the body: a
     // header understating the archive cannot make more arrive. GitHub always
     // sends one; a proxy that omits it is refused rather than read unbounded.
     match response.content_length() {
         Some(size) if size <= MAX_THEME => {}
-        Some(size) => bail!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024),
-        None => bail!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
+        Some(size) => {
+            refuse!("主题包 {} MiB，超过 {} MiB 的上限", size / 1024 / 1024, MAX_THEME / 1024 / 1024)
+        }
+        None => refuse!("下载没有给出大小，无法确认它在 {} MiB 以内", MAX_THEME / 1024 / 1024),
     }
-    let archive = response.bytes().await?;
+    let archive = response.bytes().await.with_context(unreachable)?;
+    // Checked here as well as in `unpack`, whose answer is written for an upload.
+    // A proxy answers with a page of its own -- a block notice, a sign-in wall --
+    // under a 200.
+    if !archive.starts_with(&crate::frontend::GZIP_MAGIC) {
+        if proxy {
+            refuse!("GitHub 代理返回的不是主题包，换一个代理，或清空代理让 hub 直连");
+        }
+        refuse!("release {tag} 里的 {ARCHIVE} 不是 gzip 格式，包本身有问题，请联系主题作者");
+    }
 
-    // The same unpacking, validation and atomic replace an upload undergoes,
-    // constrained to the theme it may replace. The built-in theme has no
-    // directory until this runs: updating it writes one, which then serves in
-    // place of the embedded copy until it is deleted.
-    let (themes, short) = (app.themes.clone(), short.to_owned());
-    let theme = tokio::task::spawn_blocking(move || {
-        crate::frontend::install(&themes, std::io::Cursor::new(archive), Some(&short))
+    // The same unpacking, validation and atomic replace an upload undergoes.
+    let (themes, expect) = (app.themes.clone(), expect.map(str::to_owned));
+    tokio::task::spawn_blocking(move || {
+        crate::frontend::install(&themes, std::io::Cursor::new(archive), expect.as_deref())
     })
-    .await??;
-    Ok((true, theme.version))
+    .await?
 }
 
-/// The thumbnail the theme list displays, where the theme provides one. A theme
-/// without one returns 404, on which the panel hides the image, so nothing need
-/// report whether a preview exists.
+/// The thumbnail the theme list displays, where the theme provides one; the list
+/// reports which do.
 pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match crate::frontend::preview(&app.themes, &short) {
         // Not cached: reinstalling a theme under the same name also replaces the
@@ -1437,13 +1837,79 @@ pub async fn theme_preview(_: Admin, State(app): State<Shared>, Path(short): Pat
 pub async fn delete_theme(_: Admin, State(app): State<Shared>, Path(short): Path<String>) -> Response {
     match crate::frontend::remove(&app.themes, &short) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => bad(&format!("{e:#}")),
+        Err(e) => fail(e),
+    }
+}
+
+/// Where a theme's saved settings live. Keyed by `short` in the database rather
+/// than stored beside the theme, so updating, reinstalling or deleting the
+/// theme leaves them in place, and a backup carries them.
+fn theme_config_key(short: &str) -> String {
+    format!("theme_config:{short}")
+}
+
+/// The settings saved for one theme in the panel: only the fields changed from
+/// the defaults its `theme.json` declares, which the theme fills in itself.
+/// Any theme may be named, installed or not, so a theme under development
+/// reads its own settings from whichever hub it proxies to.
+///
+/// Anonymous, under the same condition as `/api/nodes`. One request is one
+/// primary-key read answering at most 64 KiB, the router's body limit having
+/// bounded the write. That is the cost class of `/api/me`, so there is no gate:
+/// on a three-core hub (debug build), 120 concurrent requests for a 60 KiB
+/// value held the panel's `/api/nodes` at a 230 ms median, against 160 ms
+/// under the same load on `/api/me`.
+///
+/// A failed read answers 500 rather than `{}`: the panel saves on top of what
+/// it reads, so an empty answer would erase every saved override.
+pub async fn theme_config(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(short): Path<String>,
+) -> Response {
+    if !authed(&app, &headers) && !app.public_page() {
+        return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
+    }
+    if !crate::frontend::valid_short(&short) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match app.db.lookup(&theme_config_key(&short)) {
+        Ok(saved) => {
+            let saved = saved.unwrap_or_else(|| "{}".into());
+            ([(header::CONTENT_TYPE, "application/json")], saved).into_response()
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Replaces a theme's saved settings. Values are not checked against the
+/// theme's declared fields: the theme must validate what it reads regardless,
+/// since a value saved under one version of the theme meets the next.
+pub async fn save_theme_config(
+    _: Admin,
+    State(app): State<Shared>,
+    Path(short): Path<String>,
+    Json(values): Json<serde_json::Map<String, Value>>,
+) -> Response {
+    if !crate::frontend::valid_short(&short) || !crate::frontend::selectable(&app, &short) {
+        return bad("主题没有安装");
+    }
+    match app.db.set(&theme_config_key(&short), &Value::Object(values).to_string()) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => fail(e),
     }
 }
 
 pub async fn themes(_: Admin, State(app): State<Shared>) -> Response {
     match crate::frontend::themes(&app) {
-        Ok(themes) => Json(json!({"themes": themes})).into_response(),
+        Ok(mut themes) => {
+            // Reads each image to answer, as serving it would: a handful of
+            // themes, each image capped at 8 MiB.
+            for theme in &mut themes {
+                theme.preview = crate::frontend::preview(&app.themes, &theme.short).is_some();
+            }
+            Json(json!({"themes": themes})).into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -1518,13 +1984,15 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
     // `{"public_page": false}`, `{"retention_days": 7}` -- was formerly skipped by
     // a bare `continue`, so nothing was written while the response reported
     // success.
-    let Some(value) = value.as_str() else { return Some(format!("{key} must be a string")) };
+    let Some(value) = value.as_str() else { return Some(format!("设置 {key} 的值格式不对")) };
     match key {
-        "theme" if !crate::frontend::selectable(app, value) => Some("theme is not installed".into()),
+        "theme" if !crate::frontend::selectable(app, value) => Some("主题没有安装".into()),
         // Housekeeping clamps whatever it reads, so an unparsable value would be
-        // stored, echoed back, and silently mean 7 days indefinitely.
-        "retention_days" if !value.parse::<i64>().is_ok_and(|d| (1..=3_650).contains(&d)) => {
-            Some("retention days must be a number from 1 to 3650".into())
+        // stored, echoed back, and silently mean the default indefinitely.
+        "retention_days"
+            if !value.parse::<i64>().is_ok_and(|d| (1..=db::MAX_RETENTION_DAYS).contains(&d)) =>
+        {
+            Some(format!("历史保留天数要在 1 到 {} 之间", db::MAX_RETENTION_DAYS))
         }
         // The hub fetches this URL itself, so it must be one: a scheme it cannot
         // speak turns every agent download into a 502 that says nothing about the
@@ -1536,13 +2004,13 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         // chooses that binary, while the node still sees a valid TLS connection to
         // the hub.
         "github_proxy" if !(value.is_empty() || value.starts_with("https://")) => {
-            Some("GitHub proxy must start with https://: the agent binary is fetched through it and installed on every node".into())
+            Some("GitHub 代理必须以 https:// 开头：agent 程序经它下载，再安装到每个节点".into())
         }
-        "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
+        "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
-        _ => Some(format!("unknown setting: {key}")),
+        _ => Some(format!("没有这个设置项：{key}")),
     }
 }
 
@@ -1552,7 +2020,7 @@ pub async fn save_settings(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let Some(map) = body.as_object() else { return bad("expected an object") };
+    let Some(map) = body.as_object() else { return bad("设置格式不对") };
     for (key, value) in map {
         if let Some(message) = setting_error(&app, key, value) {
             return bad(&message);
@@ -1587,7 +2055,7 @@ mod tests {
     use super::*;
     // Sessions remain hashed; only node tokens are stored in the clear.
     use crate::auth::sha256;
-    use crate::db::Db;
+    use crate::db::{Db, Span};
 
     /// What a browser on `https://monitor.example.com` sends with a panel write.
     fn panel_headers() -> HeaderMap {
@@ -1599,6 +2067,28 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
+    /// and a test holding all of its permits would refuse a parallel one with a
+    /// 503. Tokio's mutex, since the guard is held across awaits.
+    static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A lookup nobody can refresh must not hide an update all day, and a panel
+    /// left open on a screen must not ask GitHub on every load.
+    #[test]
+    fn a_release_lookup_is_held_for_six_hours_and_a_failed_one_for_ten_minutes() {
+        let now = Utc::now().timestamp();
+        let read = |read_at, hub: &str, agent: &str| crate::Releases {
+            read_at,
+            hub: hub.into(),
+            agent: agent.into(),
+        };
+        assert!(!fresh_enough(&crate::Releases::default(), now), "nothing has been read yet");
+        assert!(fresh_enough(&read(now - 5 * 3600, "1.2.0", "1.1.0"), now));
+        assert!(!fresh_enough(&read(now - 7 * 3600, "1.2.0", "1.1.0"), now));
+        assert!(fresh_enough(&read(now - 300, "", ""), now), "a failure is held briefly");
+        assert!(!fresh_enough(&read(now - 1200, "1.2.0", ""), now), "half an answer is a failure");
     }
 
     fn app_with_site(site: &str) -> App {
@@ -1757,19 +2247,23 @@ mod tests {
         assert_eq!(stored, vec![5, 60, 3_600]);
     }
 
-    /// The update path follows a manifest's `url` to build a download address, so
-    /// what counts as a GitHub repository constitutes the entire trust boundary:
-    /// whatever this accepts, the hub will fetch.
+    /// The update and install paths follow a manifest's `url` or a pasted address
+    /// to build a download address, so what counts as a GitHub repository
+    /// constitutes the entire trust boundary: whatever this accepts, the hub will
+    /// fetch.
     #[test]
     fn only_a_github_repository_url_can_name_a_release_to_download() {
         assert_eq!(
             github_repo("https://github.com/monitor-probe/monitor"),
             Some(("monitor-probe", "monitor"))
         );
-        // A link to the repository, in whatever form the author wrote it.
+        // A link to the repository, in whatever form the author wrote it or the
+        // address bar showed it.
         assert_eq!(github_repo("https://github.com/a/b.git"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/tree/main"), Some(("a", "b")));
         assert_eq!(github_repo("https://github.com/a/b/"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b?tab=readme-ov-file"), Some(("a", "b")));
+        assert_eq!(github_repo("https://github.com/a/b#readme"), Some(("a", "b")));
 
         for hostile in [
             "",
@@ -1786,7 +2280,8 @@ mod tests {
             // Anything that could open a segment of its own in the URL built from
             // it, whether encoded, queried or fragmented.
             "https://github.com/a/b%2f..%2fc",
-            "https://github.com/a/b?x=1",
+            "https://github.com/a?x=/b",
+            "https://github.com/a#/b",
             "https://github.com/a b",
         ] {
             assert_eq!(github_repo(hostile), None, "{hostile} must not name a download");
@@ -1918,8 +2413,9 @@ mod tests {
         let app = app();
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
-        // A month of history at the rate the hub writes it. Two probes, because
-        // the budget is per series and a single-probe fixture would conceal that.
+        // A month of history at the rate the hub writes it, folded as the hourly
+        // pass would. Two probes, because the budget is per series and a
+        // single-probe fixture would conceal that.
         const PROBES: i64 = 2;
         for _ in 0..PROBES {
             task(&app, vec![id]);
@@ -1927,17 +2423,21 @@ mod tests {
         for i in 0..30 * 1440 {
             app.db.insert_metric(id, now - i * 60, &json!({"cpu": 1.0})).unwrap();
             for task in 1..=PROBES {
-                app.db.insert_ping(id, task, now - i * 20, 42).unwrap();
+                app.db.insert_pings(id, &[(task, now - i * 60, 42)]).unwrap();
             }
         }
+        app.db.roll_up(now, 365).unwrap();
 
         // Including windows that do not divide evenly, which are where a step
-        // rounded the wrong way overruns.
-        for hours in [1, 6, 13, 23, 24, 168, 2_160] {
-            let step = sample_step(hours, None);
-            let since = now - hours * 3_600;
-            let metrics = app.db.metrics(id, since, step).unwrap();
-            let (ping, _) = app.db.ping_records(id, since, step).unwrap();
+        // rounded the wrong way overruns, and both sides of the hourly tier.
+        for hours in [1, 6, 13, 23, 24, 168, 169, 720, 8_760] {
+            let span = span(hours, None, now);
+            assert_eq!(span.hourly, hours > 168, "{hours}h");
+            if span.hourly {
+                assert_eq!(span.step % 3_600, 0, "{hours}h: an hourly row straddles two points");
+            }
+            let metrics = app.db.metrics(id, span).unwrap();
+            let (ping, _) = app.db.ping_records(id, span).unwrap();
             // Against the budget itself rather than whatever the step produced:
             // derived from the step, this would only demonstrate that division
             // works. One bucket of slack, as the window rarely divides evenly.
@@ -1952,24 +2452,23 @@ mod tests {
             assert!(!metrics.is_empty() && !ping.is_empty(), "{hours}h returned nothing");
             // A bucket the window opens partway through begins before it.
             assert!(
-                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= since - step),
+                metrics.iter().all(|m| m["ts"].as_i64().unwrap() >= span.since - span.step),
                 "{hours}h reached back too far"
             );
         }
-        // The widest window costs no more than a narrow one: unthinned, a month of
-        // history is 43,200 rows.
-        assert!(app.db.metrics(id, now - 2_160 * 3_600, sample_step(2_160, None)).unwrap().len() <= 1_441);
 
         // A day returns every minute it holds: thinning exists only for what the
         // screen cannot draw.
-        assert_eq!(sample_step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
-        assert_eq!(sample_step(6, Some(2_000)), 60, "and so does six hours");
+        let step = |hours, points| span(hours, points, now).step;
+        assert_eq!(step(24, Some(2_000)), 60, "a day of minutes fits under the ceiling");
+        assert_eq!(step(6, Some(2_000)), 60, "and so does six hours");
+        assert_eq!(step(720, None), 3_600, "a month is its hours");
 
         // A caller may request less than the budget, never more: the ceiling
         // belongs to the hub, since this path takes no credentials.
-        assert!(sample_step(24, Some(390)) > sample_step(24, None));
-        assert_eq!(sample_step(24, Some(100_000)), sample_step(24, None));
-        assert_eq!(sample_step(24, Some(0)), sample_step(24, Some(60)));
+        assert!(step(24, Some(390)) > step(24, None));
+        assert_eq!(step(24, Some(100_000)), step(24, None));
+        assert_eq!(step(24, Some(0)), step(24, Some(60)));
 
         // Requesting one half leaves the other empty rather than sending it: on
         // the day window that half was two thirds of the response.
@@ -1991,26 +2490,35 @@ mod tests {
         let base = Utc::now().timestamp() / 120 * 120 - 120;
         // One bucket: a quiet minute and a busy one, then a probe that answered
         // once and timed out three times.
-        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0})).unwrap();
-        app.db.insert_metric(id, base + 70, &json!({"cpu": 40.0, "net_rx": 1_000})).unwrap();
+        // The quiet minute predates the peak column, whose default is 0.
+        app.db.insert_metric(id, base + 10, &json!({"cpu": 0.0, "net_rx": 0, "net_tx": 3_000})).unwrap();
+        app.db
+            .insert_metric(
+                id,
+                base + 70,
+                &json!({"cpu": 40.0, "net_rx": 1_000, "net_rx_max": 4_000, "net_tx": 1_000, "net_tx_max": 2_000}),
+            )
+            .unwrap();
         for _ in 0..3 {
             task(&app, vec![id]);
         }
         for (i, latency) in [30, -1, -1, -1].into_iter().enumerate() {
-            app.db.insert_ping(id, 1, base + 10 + i as i64 * 20, latency).unwrap();
+            app.db.insert_pings(id, &[(1, base + 10 + i as i64 * 20, latency)]).unwrap();
         }
         // A second probe that never answered, and a third that answered cleanly.
-        app.db.insert_ping(id, 2, base + 10, -1).unwrap();
-        app.db.insert_ping(id, 3, base + 10, 12).unwrap();
+        app.db.insert_pings(id, &[(2, base + 10, -1)]).unwrap();
+        app.db.insert_pings(id, &[(3, base + 10, 12)]).unwrap();
 
-        let m = &app.db.metrics(id, base, 120).unwrap()[0];
+        let m = &app.db.metrics(id, Span::minutes(base, 120)).unwrap()[0];
         assert_eq!(m["cpu"], 20.0, "the bucket is its mean, not one row of it");
         assert_eq!(m["net_rx"], 500);
+        assert_eq!(m["net_rx_max"], 4_000, "the bucket peaks where its busiest minute did");
+        assert_eq!(m["net_tx_max"], 3_000, "a row without a peak counts as its own mean");
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
-        // Keyed by task rather than index: the rows share a timestamp, so
-        // `ORDER BY ts` leaves their order to SQLite.
-        let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
+        // Keyed by task rather than index: the order is the panel's, which
+        // `a_probe_chart_follows_the_panel_order` covers.
+        let (rows, window_loss) = app.db.ping_records(id, Span::minutes(base, 120)).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
         };
@@ -2036,9 +2544,9 @@ mod tests {
         let wide_probe = task(&app, vec![wide]);
         let wide_base = base / 180 * 180;
         for i in 0..180 {
-            app.db.insert_ping(wide, wide_probe, wide_base + i, if i == 0 { -1 } else { 20 }).unwrap();
+            app.db.insert_pings(wide, &[(wide_probe, wide_base + i, if i == 0 { -1 } else { 20 })]).unwrap();
         }
-        let (rows, _) = app.db.ping_records(wide, wide_base, 180).unwrap();
+        let (rows, _) = app.db.ping_records(wide, Span::minutes(wide_base, 180)).unwrap();
         assert_eq!(rows.len(), 1, "the fixture has to be one bucket for this to mean anything");
         let row = &rows[0];
         assert_eq!(row["loss"], 1, "a bucket that lost one of 180 has not lost none");
@@ -2049,9 +2557,9 @@ mod tests {
         let jitter = node(&app, "jitter", true);
         let jitter_probe = task(&app, vec![jitter]);
         for (i, latency) in [10, 20, 50, 20, 20].into_iter().enumerate() {
-            app.db.insert_ping(jitter, jitter_probe, wide_base + i as i64, latency).unwrap();
+            app.db.insert_pings(jitter, &[(jitter_probe, wide_base + i as i64, latency)]).unwrap();
         }
-        let row = &app.db.ping_records(jitter, wide_base, 180).unwrap().0[0];
+        let row = &app.db.ping_records(jitter, Span::minutes(wide_base, 180)).unwrap().0[0];
         assert_eq!(row["latency"], 20, "the middle answer, not the mean of 24");
         assert_eq!(row["band"], json!([10, 50]));
 
@@ -2061,9 +2569,9 @@ mod tests {
         let even = node(&app, "even", true);
         let even_probe = task(&app, vec![even]);
         for (i, latency) in [40, 10, 30, 20].into_iter().enumerate() {
-            app.db.insert_ping(even, even_probe, wide_base + i as i64, latency).unwrap();
+            app.db.insert_pings(even, &[(even_probe, wide_base + i as i64, latency)]).unwrap();
         }
-        assert_eq!(app.db.ping_records(even, wide_base, 180).unwrap().0[0]["latency"], 25);
+        assert_eq!(app.db.ping_records(even, Span::minutes(wide_base, 180)).unwrap().0[0]["latency"], 25);
     }
 
     /// What a window lost is the proportion of its samples lost, and only the hub
@@ -2083,11 +2591,11 @@ mod tests {
         // A full minute at five seconds per round with no loss, then a minute
         // holding one sample, which was lost, before the probe stopped.
         for i in 0..12 {
-            app.db.insert_ping(id, probe, base + i * 5, 20).unwrap();
+            app.db.insert_pings(id, &[(probe, base + i * 5, 20)]).unwrap();
         }
-        app.db.insert_ping(id, probe, base + 60, -1).unwrap();
+        app.db.insert_pings(id, &[(probe, base + 60, -1)]).unwrap();
 
-        let (rows, loss) = app.db.ping_records(id, base, 60).unwrap();
+        let (rows, loss) = app.db.ping_records(id, Span::minutes(base, 60)).unwrap();
         let per_bucket: Vec<i64> = rows.iter().map(|r| r["loss"].as_i64().unwrap_or(0)).collect();
         assert_eq!(per_bucket, vec![0, 100], "the buckets are right about themselves");
 
@@ -2110,15 +2618,16 @@ mod tests {
         let _held = connect(
             &app,
             open,
-            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0,
-                   "hostname": "db-prod-01", "ip": "203.0.113.7"}),
+            json!({"boot_id": "abc", "net_rx_total": 134_000_000_000i64, "cpu": 1.0, "iface": "eth1",
+                   "hostname": "db-prod-01", "ip": "203.0.113.7", "total_rx": 1}),
         );
 
         let public = visible_nodes(&app, false).unwrap();
         assert_eq!(public.len(), 1, "a node marked private must not be listed");
         assert_eq!(public[0]["name"], "open");
         // Disclosing the token would let any visitor impersonate the node.
-        for hidden in ["ip", "remark", "hostname", "token"] {
+        for hidden in ["ip", "addresses", "ipv4_auto", "ipv6_auto", "remark", "hostname", "token", "interval"]
+        {
             assert!(public[0].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert!(
@@ -2132,11 +2641,118 @@ mod tests {
             assert!(public[0]["metrics"].get(hidden).is_none(), "{hidden} must not be public");
         }
         assert_eq!(public[0]["metrics"]["cpu"], 1.0, "the rest of the report still goes out");
+        assert!(public[0]["metrics"].get("iface").is_none(), "the interface list is the panel's");
 
         let admin = visible_nodes(&app, true).unwrap();
         assert_eq!(admin.len(), 2);
         assert_eq!(admin[0]["ip"], "198.51.100.9");
         assert_eq!(admin[0]["remark"], "secret note");
+        // The panel reads `iface` and nothing else the contract leaves out.
+        assert_eq!(admin[0]["metrics"]["iface"], "eth1");
+        for hidden in ["boot_id", "net_rx_total", "hostname", "ip"] {
+            assert!(admin[0]["metrics"].get(hidden).is_none(), "{hidden} is not part of the panel's frame");
+        }
+        // The traffic inside `metrics` is the hub's, whatever the report claimed.
+        for view in [&public[0], &admin[0]] {
+            assert_eq!(view["metrics"]["total_rx"], view["total_rx"]);
+            assert_eq!(view["metrics"]["month_tx"], view["month_tx"]);
+        }
+    }
+
+    /// One address per family, marked with where it came from.
+    #[test]
+    fn a_node_shows_the_address_it_is_reached_by() {
+        let rows = |ip, held, pins| -> Vec<String> {
+            addresses(ip, held, pins).into_iter().map(|(a, source)| format!("{a} {source}")).collect()
+        };
+        let none = ("", "");
+        // A public interface is the machine; a different exit in front of it is a
+        // proxy and stays out.
+        assert_eq!(
+            rows("2001:db8::2", ("203.0.113.7", "2001:db8::2"), none),
+            ["203.0.113.7 interface", "2001:db8::2 interface"]
+        );
+        assert_eq!(rows("198.51.100.1", ("203.0.113.7", ""), none), ["203.0.113.7 interface"]);
+        // NAT: the exit replaces the private interface address, which nobody
+        // outside can use.
+        assert_eq!(rows("203.0.113.7", ("10.10.2.250", ""), none), ["203.0.113.7 exit"]);
+        assert_eq!(rows("203.0.113.7", ("100.64.0.9", ""), none), ["203.0.113.7 exit"]);
+        // An LXC guest behind NAT with a public /128, reached over v4 by a current
+        // agent...
+        assert_eq!(
+            rows("203.0.113.7", ("10.10.1.5", "2401:b60:1c::5"), none),
+            ["203.0.113.7 exit", "2401:b60:1c::5 interface"]
+        );
+        // ...and over v6 by an older one reporting the ULA ahead of it.
+        assert_eq!(rows("2401:b60:1c::5", ("10.10.1.5", "fd42:43af::1"), none), ["2401:b60:1c::5 exit"]);
+        // Behind a transparent proxy the exit is the proxy's; the home line can
+        // only be set by hand.
+        let home = ("192.168.1.5", "2409:8a1e::5");
+        assert_eq!(rows("198.51.100.77", home, none), ["198.51.100.77 exit", "2409:8a1e::5 interface"]);
+        assert_eq!(
+            rows("198.51.100.77", home, ("203.0.113.50", "")),
+            ["203.0.113.50 manual", "2409:8a1e::5 interface"]
+        );
+        // A pin wins over a public interface too, and may name a private address
+        // for use on the LAN.
+        assert_eq!(
+            rows("", ("203.0.113.7", "2001:db8::5"), ("", "2001:db8::9")),
+            ["203.0.113.7 interface", "2001:db8::9 manual"]
+        );
+        assert_eq!(rows("203.0.113.7", ("10.0.0.2", ""), ("10.0.0.2", "")), ["10.0.0.2 manual"]);
+        // No interface in the exit's family: a translator (NAT64, WARP) that does
+        // not lead to the machine.
+        assert_eq!(rows("104.28.1.1", ("", "2001:db8::5"), none), ["2001:db8::5 interface"]);
+        // An address reported under the other family's name is not that family's.
+        assert_eq!(rows("203.0.113.7", ("2001:db8::5", ""), none), ["203.0.113.7 exit"]);
+        // Nothing public anywhere: hub and node share a network, and the private
+        // addresses are all there is.
+        assert_eq!(rows("192.168.1.2", ("192.168.1.5", ""), none), ["192.168.1.5 interface"]);
+        assert_eq!(
+            rows("fd00::2", ("10.0.0.2", "fd00::5"), none),
+            ["10.0.0.2 interface", "fd00::5 interface"]
+        );
+        assert_eq!(
+            rows("198.18.0.1", ("192.168.1.5", ""), none),
+            ["192.168.1.5 interface"],
+            "a TUN proxy's fake-IP range is not public"
+        );
+        // With no interface reported the connection is all there is, and nothing
+        // says it is not the machine's own.
+        assert_eq!(rows("203.0.113.7", none, none), ["203.0.113.7 connection"]);
+        assert_eq!(rows("", ("10.0.0.2", ""), none), ["10.0.0.2 interface"]);
+        assert!(rows("", none, none).is_empty());
+
+        // The panel gets the list, and per family what shows with the pin
+        // cleared.
+        let app = app();
+        let id = node(&app, "n", true);
+        app.db
+            .save_facts(id, &json!({"ipv4": "10.10.1.5", "ipv6": "2401:b60:1c::5"}), "203.0.113.7", "")
+            .unwrap();
+        let patch: NodePatch = serde_json::from_value(json!({"ipv4_pin": "198.51.100.50"})).unwrap();
+        app.db.update_node(id, &patch).unwrap();
+        let view = &visible_nodes(&app, true).unwrap()[0];
+        assert_eq!(
+            view["addresses"],
+            json!([{"address": "198.51.100.50", "source": "manual"}, {"address": "2401:b60:1c::5", "source": "interface"}])
+        );
+        assert_eq!(
+            (&view["ipv4_auto"], &view["ipv6_auto"]),
+            (&json!("203.0.113.7"), &json!("2401:b60:1c::5"))
+        );
+
+        // Private addresses show only when nothing public is known, so the pin
+        // the other family keeps decides: v4 falls back to nothing while the v6
+        // pin stands.
+        let lan = node(&app, "lan", true);
+        app.db
+            .save_facts(lan, &json!({"ipv4": "192.168.1.5", "ipv6": "fd00::5"}), "192.168.1.2", "")
+            .unwrap();
+        let patch: NodePatch = serde_json::from_value(json!({"ipv6_pin": "2001:db8::9"})).unwrap();
+        app.db.update_node(lan, &patch).unwrap();
+        let view = visible_nodes(&app, true).unwrap().into_iter().find(|v| v["id"] == lan).unwrap();
+        assert_eq!((&view["ipv4_auto"], &view["ipv6_auto"]), (&json!(""), &json!("fd00::5")));
     }
 
     #[tokio::test]
@@ -2155,6 +2771,91 @@ mod tests {
             "the old agent's channel must be closed"
         );
         assert!(app.agents.read().unwrap().is_empty(), "the node must read as offline at once");
+    }
+
+    /// A batch writes to every selected node or to none, accepts only what a
+    /// selection can share, and a group reaches the status page.
+    #[tokio::test]
+    async fn a_batch_edit_applies_to_all_selected_nodes_or_none() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let (a, b, c) = (node(&app, "a", true), node(&app, "b", true), node(&app, "c", true));
+        let batch = |ids: Vec<i64>, patch: Value| {
+            Ok(Json(NodeBatch { ids, patch: serde_json::from_value(patch).unwrap() }))
+        };
+        let group = |id| app.db.node(id).unwrap().unwrap().group;
+
+        let r =
+            update_nodes(Admin, state(), batch(vec![a, b, a], json!({"group": " 香港 ", "notify": true})))
+                .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!((group(a), group(b), group(c)), ("香港".into(), "香港".into(), String::new()));
+        assert!(app.db.node(b).unwrap().unwrap().notify);
+
+        // One id gone: nothing is written, not even to the nodes still there.
+        let r = update_nodes(Admin, state(), batch(vec![a, 999], json!({"group": "东京"}))).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(group(a), "香港", "a refused batch leaves every node as it was");
+
+        // Only the listed fields deserialize, so the extractor refuses the rest.
+        for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
+            assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
+        }
+        // Counted in characters, not bytes: thirteen of them take 39 bytes.
+        let r = update_nodes(Admin, state(), batch(vec![a], json!({"group": "港".repeat(MAX_GROUP)}))).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let r =
+            update_nodes(Admin, state(), batch(vec![a], json!({"group": "港".repeat(MAX_GROUP + 1)}))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            update_nodes(Admin, state(), batch(vec![], json!({"notify": false}))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
+    }
+
+    /// What the panel saves is what an anonymous visitor reads, under the same
+    /// condition as the node list, and only an installed theme takes a write.
+    #[tokio::test]
+    async fn saved_theme_settings_reach_visitors_while_the_status_page_is_open() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let read = |short: &str| theme_config(state(), HeaderMap::new(), Path(short.to_owned()));
+        let body = |r: Response| async { axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap() };
+
+        assert_eq!(&body(read("default").await).await[..], b"{}", "nothing saved reads as no overrides");
+        let values = json!({"notice": "维护中", "show_price": false}).as_object().unwrap().clone();
+        let saved = save_theme_config(Admin, state(), Path("default".into()), Json(values.clone())).await;
+        assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+        let read_back: Value = serde_json::from_slice(&body(read("default").await).await).unwrap();
+        assert_eq!(read_back, Value::Object(values.clone()));
+
+        let missing = save_theme_config(Admin, state(), Path("aurora".into()), Json(values.clone())).await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST, "a theme that is not installed takes no write");
+        assert_eq!(read("../etc").await.status(), StatusCode::NOT_FOUND);
+
+        app.db.set("public_page", "off").unwrap();
+        assert_eq!(
+            read("default").await.status(),
+            StatusCode::UNAUTHORIZED,
+            "a closed status page hides them too"
+        );
+    }
+
+    /// Days to expiry are counted on the hub's calendar and are public, like the
+    /// date itself; no date counts nothing.
+    #[test]
+    fn days_to_expiry_follow_the_hubs_calendar() {
+        let app = app();
+        let id = node(&app, "a", true);
+        let expires_in = || visible_nodes(&app, false).unwrap()[0]["expires_in"].clone();
+        assert_eq!(expires_in(), Value::Null);
+        let today = Local::now().date_naive();
+        for days in [3, 0, -1] {
+            app.db.set_expiry(id, &(today + chrono::Duration::days(days)).to_string()).unwrap();
+            assert_eq!(expires_in(), json!(days));
+        }
     }
 
     /// A write naming a node that no longer exists, such as one deleted from
@@ -2277,6 +2978,11 @@ mod tests {
             json!({"name": "x", "traffic_reset_day": 99}),
             json!({"name": "x", "price": -5.0}),
             json!({"name": "x", "traffic_limit": -1}),
+            json!({"name": "x", "currency": "USDT"}),
+            json!({"name": "x", "currency": "港币"}),
+            json!({"name": "x", "billing_cycle": "0m"}),
+            json!({"name": "x", "billing_cycle": "1201m"}),
+            json!({"name": "x", "billing_cycle": "weekly"}),
         ] {
             let created = create_node(
                 Admin,
@@ -2296,6 +3002,29 @@ mod tests {
             assert_eq!(updated.status(), StatusCode::BAD_REQUEST, "update accepted {bad}");
         }
         assert_eq!(app.db.nodes().unwrap().len(), 1, "nothing was created");
+    }
+
+    /// A length with a name is stored under it, so a theme built for hub 1.3.0
+    /// still labels it.
+    #[tokio::test]
+    async fn currency_and_cycle_are_stored_in_one_spelling() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        for (sent, currency, cycle) in [
+            (json!({"currency": " hkd ", "billing_cycle": "60m"}), "HKD", "60m"),
+            (json!({"billing_cycle": "12m"}), "HKD", "yearly"),
+            (json!({"billing_cycle": "once"}), "HKD", "once"),
+        ] {
+            let put = update_node(
+                Admin,
+                State(app.clone()),
+                Path(id),
+                Ok(Json(serde_json::from_value(sent).unwrap())),
+            );
+            assert_eq!(put.await.status(), StatusCode::OK);
+            let stored = app.db.node(id).unwrap().unwrap();
+            assert_eq!((stored.currency.as_str(), stored.billing_cycle.as_str()), (currency, cycle));
+        }
     }
 
     /// A stream outlives the request that opened it, so everything the handshake
@@ -2515,9 +3244,9 @@ mod tests {
     fn a_node_view_carries_traffic_even_while_offline() {
         let app = app();
         let id = node(&app, "n", true);
-        app.db.accumulate(id, "b", Some((100, 100))).unwrap();
-        app.db.accumulate(id, "b", Some((900, 500))).unwrap();
-        app.db.touch_seen(id, 1_700_000_000).unwrap();
+        app.db.accumulate(id, "b", (100, 100), Local::now()).unwrap();
+        app.db.accumulate(id, "b", (900, 500), Local::now()).unwrap();
+        app.db.touch_seen(id, 1_700_000_000, &serde_json::Value::Null).unwrap();
 
         let view = &visible_nodes(&app, true).unwrap()[0];
         assert_eq!(view["online"], false);
@@ -2569,13 +3298,14 @@ mod tests {
         assert_eq!(app.db.node(id).unwrap().unwrap().disk_total, 30i64 << 30, "and no extra write to get it");
     }
 
-    /// `PUBLIC_HOURS` bounds one window; this bounds how many are built
+    /// `span` bounds one window; this bounds how many are built
     /// concurrently. Each holds the connection the agents report through for its
-    /// entire scan, and the path takes no credentials -- the same arrangement
-    /// `RELAY_GATE` and `PASSWORD_GATE` enforce on the other two anonymous paths
-    /// that make this process work hard.
+    /// entire scan, and the path takes no credentials. `PASSWORD_GATE` refuses the
+    /// same way; `RELAY_GATE` queues briefly instead, as a batch install is one
+    /// burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let ask = || {
@@ -2667,11 +3397,13 @@ mod tests {
         assert!(readable(&app, true, open), "and never closes it for the panel");
     }
 
-    /// The window ceiling is a scan bound rather than a response bound: the
-    /// thinning already limits the row count, while a quarter-year still reads
-    /// every row behind it holding the write connection.
+    /// The retention window is the ceiling for every caller: no width reads more
+    /// than the week of minute rows, so wider windows need no separate bound for
+    /// anonymous callers, and a window past what is kept would only draw
+    /// history that is not there.
     #[tokio::test]
-    async fn an_anonymous_history_window_stops_at_a_week() {
+    async fn a_history_window_stops_at_the_retention_window() {
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
@@ -2684,23 +3416,35 @@ mod tests {
         }
         let ask = |hours| {
             let query = format!("hours={hours}&series=metrics");
-            metrics(
-                State(app.clone()),
-                HeaderMap::new(),
-                Path(id),
-                Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
-            )
+            let app = app.clone();
+            async move {
+                let answer = metrics(
+                    State(app),
+                    HeaderMap::new(),
+                    Path(id),
+                    Query(serde_urlencoded::from_str::<Window>(&query).unwrap()),
+                )
+                .await;
+                axum::body::to_bytes(answer.into_body(), usize::MAX).await.unwrap()
+            }
         };
         let rows =
-            |body: &str| serde_json::from_str::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
+            |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap()["metrics"].as_array().unwrap().len();
 
-        let week = axum::body::to_bytes(ask(168).await.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(rows(std::str::from_utf8(&week).unwrap()), 8, "a week reaches back seven days");
+        // Before the first rollup nothing is folded, and a window past the week
+        // reads the newest week of minute rows rather than every one.
+        app.db.set("retention_days", "30").unwrap();
+        assert_eq!(rows(&ask(720).await), 8, "unfolded minute rows past the week are not read");
+        app.db.roll_up(now, 90).unwrap();
 
-        // Requesting the quarter year formerly available to an anonymous caller
-        // returns the week: the extra rows exist, and reading them is the cost.
-        let quarter = axum::body::to_bytes(ask(2_160).await.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(quarter, week, "an anonymous window past a week is clamped to one");
+        app.db.set("retention_days", "7").unwrap();
+        let week = ask(168).await;
+        assert_eq!(rows(&week), 8, "a week reaches back seven days");
+        assert_eq!(ask(2_160).await, week, "a window past the retention window is narrowed to it");
+
+        // Past the week, from the hourly tier and the minute rows after it.
+        app.db.set("retention_days", "30").unwrap();
+        assert_eq!(rows(&ask(2_160).await), 30, "a month reaches back thirty days");
     }
 
     #[tokio::test]
@@ -2774,8 +3518,8 @@ mod tests {
     }
 
     /// Housekeeping clamps whatever it finds, so an unparsable value is not an
-    /// error downstream: it silently means 7 days, in a field still displaying
-    /// what was entered.
+    /// error downstream: it silently means the default, in a field still
+    /// displaying what was entered.
     #[tokio::test]
     async fn a_retention_window_that_would_never_apply_is_refused() {
         let app = std::sync::Arc::new(app());
@@ -2803,7 +3547,7 @@ mod tests {
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
         let Json(read) = settings(Admin, State(app.clone())).await;
-        assert_eq!(read["retention_days"], "7", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -2824,7 +3568,7 @@ mod tests {
             StatusCode::OK,
             "a fresh hub's own settings must survive a round trip"
         );
-        assert_eq!(app.db.retention_days(), 7, "and the stored window is the one that was shown");
+        assert_eq!(app.db.retention_days(), 30, "and the stored window is the one that was shown");
     }
 
     #[tokio::test]
@@ -2844,5 +3588,35 @@ mod tests {
         for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
             assert!(!body.to_string().contains(secret), "{secret}");
         }
+    }
+
+    /// What every error response is held to: text written for the reader passes
+    /// as it is, and nothing else -- a library's error, axum's rejection wording
+    /// -- reaches the body.
+    #[tokio::test]
+    async fn only_written_text_reaches_an_error_response() {
+        let read = |r: Response| async move {
+            let r = plain_errors(r).await;
+            let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+        let raw = || std::io::Error::other("/opt/monitor/data/themes/.staging-1: incomplete deflate stream");
+
+        let internal = fail(raw());
+        assert_eq!(internal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(read(internal).await, INTERNAL);
+
+        // The shown message, wherever it sits in the chain, and never its cause.
+        let wrapped =
+            anyhow::Error::from(raw()).context(crate::Shown("主题包损坏".into())).context("installing");
+        let refused = fail(wrapped);
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(read(refused).await, "主题包损坏");
+
+        let rejection =
+            (StatusCode::UNPROCESSABLE_ENTITY, "Failed to deserialize the JSON body").into_response();
+        assert_eq!(read(rejection).await, "请求格式不对");
+        assert_eq!(read(StatusCode::UNAUTHORIZED.into_response()).await, "登录已失效，请重新登录");
+        assert_eq!(read(bad("请填写节点名称")).await, "请填写节点名称");
     }
 }

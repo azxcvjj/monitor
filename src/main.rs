@@ -4,6 +4,26 @@
 //! and the database path is configured in the panel and stored in SQLite,
 //! leaving no config file to track and no secrets in plaintext TOML.
 
+/// Error text written for whoever reads the reply: the only error wording a
+/// response may carry. `api::fail` answers an error with the outermost one in
+/// its chain, and an error without one with a fixed message, logging the chain
+/// in full; a file path, a SQL error or a library's wording stays in the log.
+#[derive(Debug)]
+pub struct Shown(pub String);
+
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `anyhow::bail!` with a [`Shown`] message.
+macro_rules! refuse {
+    ($($arg:tt)*) => {
+        return Err(anyhow::Error::msg($crate::Shown(format!($($arg)*))))
+    };
+}
+
 mod agent_ws;
 mod api;
 mod auth;
@@ -22,7 +42,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{Local, Months, NaiveDate};
+use chrono::{DateTime, Local, Months, NaiveDate, TimeZone, Timelike, Utc};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -38,6 +58,10 @@ pub struct App {
     /// and its latest report. A single map, since connectivity and current
     /// figures are one fact about a node rather than two. See `agent_ws`.
     pub agents: RwLock<HashMap<i64, Agent>>,
+    /// Each node's newest traffic reading, booked about once a minute rather
+    /// than with every report. Per node rather than per connection; see
+    /// `agent_ws::file`.
+    pub readings: Mutex<HashMap<i64, agent_ws::Reading>>,
     /// Last rendered node list per audience, `[public, admin]`, with the
     /// millisecond it was built. Shared by every browser stream so viewers do
     /// not multiply the query load. See `api::live_snapshot`.
@@ -58,6 +82,19 @@ pub struct App {
     pub themes: PathBuf,
     /// Alerts on their way out; see `notify::send`.
     pub notes: tokio::sync::mpsc::Sender<notify::Note>,
+    /// The latest published tags, as last read from GitHub. Filled when the panel
+    /// asks rather than on a timer, so a hub nobody opens makes no outbound
+    /// request; see `api::versions`.
+    pub releases: Mutex<Releases>,
+}
+
+#[derive(Default, Clone)]
+pub struct Releases {
+    /// The second these were read, 0 before the first read.
+    pub read_at: i64,
+    /// Tags without their leading `v`, empty where the lookup failed.
+    pub hub: String,
+    pub agent: String,
 }
 
 impl App {
@@ -65,6 +102,7 @@ impl App {
         Self {
             db,
             agents: RwLock::default(),
+            readings: Mutex::default(),
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
@@ -75,6 +113,7 @@ impl App {
             site,
             themes,
             notes,
+            releases: Mutex::default(),
         }
     }
 
@@ -114,9 +153,11 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
     Some(chain.split(',').next()?.trim())
 }
 
-/// Where the agent binaries are published. Not a setting: redirecting it
-/// implies a fork, which rebuilds this line anyway.
-const AGENT_REPO: &str = "monitor-probe/agent";
+/// Where the agent binaries are published, and where this hub is published. Not
+/// settings: redirecting either implies a fork, which rebuilds these lines
+/// anyway.
+pub const AGENT_REPO: &str = "monitor-probe/agent";
+pub const HUB_REPO: &str = "monitor-probe/monitor";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -157,11 +198,24 @@ pub fn proxied(app: &App, url: String) -> String {
 /// caller can request. Streaming bounds the memory each transfer holds; this
 /// bounds how many may run, closing the same gap as the password gate in `auth`.
 ///
-/// Four, because a node installs once: a handful of machines set up together is
-/// the expected load, not a sustained workload. Refused rather than queued, for
-/// the same reason.
+/// Four, because a node installs once: the load is a burst, not a sustained
+/// workload. A batch install or upgrade sent to many machines at once -- by an
+/// SSH client broadcasting one command, a provider's boot script, a parallel
+/// tool -- arrives as exactly that burst, so a request past the four waits
+/// its turn for up to [`RELAY_WAIT`] rather than being refused at once, which
+/// would fail eight of twelve parallel downloads within 2 ms. The semaphore is
+/// FIFO, and a waiting request holds its connection alone: no fetch, no buffer.
+/// Waiters are not counted, so how many can wait is bounded by the connections
+/// the process may hold, the same bound as for a client that connects and then
+/// sends nothing.
 const RELAY_SLOTS: usize = 4;
 static RELAY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(RELAY_SLOTS);
+
+/// Longest a request waits for a relay slot before the 503. Below the 60 s nginx
+/// and the 100 s Cloudflare allow for a response head, so the refusal is the
+/// hub's own and says why; `install.sh` retries it. At about a second per
+/// transfer, four slots drain some 120 queued machines within it.
+const RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Longest a relay may hold its permit.
 ///
@@ -228,10 +282,10 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 /// releases.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
-        return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
+        return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     }
-    let Ok(permit) = RELAY_GATE.try_acquire() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
+    let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
+        return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
     let url = release_url(&app, &arch);
     // The default client timeout is sized for API calls, not a 1.8 MB download.
@@ -245,10 +299,18 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
             axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
         )
             .into_response(),
-        Ok(res) => {
-            (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
+        Ok(res) => api::answer(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub answered {} for the agent release", res.status()),
+        ),
+        // English, as `install.sh` prints it after its own English line.
+        Err(e) => {
+            warn!("relaying the agent from {url} failed: {e:#}");
+            api::answer(
+                StatusCode::BAD_GATEWAY,
+                "the hub could not reach GitHub or its GitHub proxy; its log has the details",
+            )
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
     }
 }
 
@@ -304,10 +366,15 @@ fn parse_args() -> Result<Args> {
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
-                     --site is only needed behind a reverse proxy, where the address the\n\
-                     panel is reached on is not the one agents should use. Left out, the\n\
-                     hub answers on whatever ip:port it is asked, and the panel builds\n\
-                     install commands from the address in the browser's bar.\n\
+                     --site is the https:// domain agents should use. Left out, the hub\n\
+                     answers on whatever ip:port it is asked, and the panel builds install\n\
+                     commands from the address in the browser's bar, which behind a TLS\n\
+                     reverse proxy is already right. It is needed where agents reach the\n\
+                     hub by another name than the panel's; where the panel is opened\n\
+                     through an SSH tunnel, whose loopback address no node can reach and\n\
+                     which adds no node without it; and where the proxy sends no\n\
+                     X-Forwarded-Proto, since it then sets the session cookie's Secure\n\
+                     flag. A value that is not an https:// domain disables adding nodes.\n\
                      --reset-password replaces the emergency password, signs every session\n\
                      out, prints the new password and exits. The database must exist.",
                     env!("CARGO_PKG_VERSION")
@@ -354,16 +421,34 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(&args.themes)?;
+    if let Err(e) = db::temp_files_beside(&args.database) {
+        warn!("SQLite keeps its temporary files in its default directory: {e:#}");
+    }
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
+    let port = args.listen.port();
+    // On a container's bridge network the host side of `-p` decides who can
+    // connect, which the hub cannot see, and a loopback listener would leave the
+    // published port with nothing behind it. Under host networking the listener
+    // is the host's own, as on a bare host. The marker files do not tell the two
+    // apart, so the advice names both.
+    let close = if in_container() {
+        format!(
+            "publish it on the host's loopback only (-p 127.0.0.1:HOST_PORT:{port}) or not at all when \
+             the proxy shares the container's network; under host networking, --listen \
+             127.0.0.1:{port} instead"
+        )
+    } else {
+        format!("--listen 127.0.0.1:{port}")
+    };
     if exposed_over_plain_http(&url) {
         warn!(
             "this hub answers plain HTTP at {url}; sessions and agent tokens travel in the clear. \
              Put it behind a TLS reverse proxy -- the panel builds install commands from the \
-             browser's own address, so nothing here has to change -- then --listen 127.0.0.1:PORT \
-             so this port is no longer reachable in the clear"
+             browser's own address, so nothing here has to change -- and close this port so the \
+             proxy is the only way in: {close}"
         );
     }
     // The warning above derives from --site, the address the operator
@@ -375,10 +460,9 @@ async fn main() -> Result<()> {
     else if !args.listen.ip().is_loopback() {
         warn!(
             "listening on {} in the clear. If a TLS proxy fronts this hub, callers can still reach \
-             this port directly and set their own X-Forwarded-Proto -- --listen 127.0.0.1:{} so the \
-             proxy is the only way in",
-            args.listen,
-            args.listen.port()
+             this port directly and set their own X-Forwarded-Proto. Close it so the proxy is the \
+             only way in: {close}",
+            args.listen
         );
     }
     // Checked once here, because the answer is static: `provisioning_allowed`
@@ -398,21 +482,18 @@ async fn main() -> Result<()> {
         );
     }
 
+    let held = app.clone();
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
-        // Agents.
-        .route("/api/agent/ws", get(agent_ws::handler))
-        .route("/api/agent/register", post(api::agent_register))
-        .route("/install.sh", get(install_script))
-        .route("/agent/{arch}", get(agent_binary))
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
         .route("/api/nodes/{id}/metrics", get(api::metrics))
         .route("/api/ws", get(api::live_ws))
+        .route("/api/themes/{short}/config", get(api::theme_config))
         // Sign-in.
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -422,19 +503,26 @@ async fn main() -> Result<()> {
         .route("/api/nodes", post(api::create_node))
         .route("/api/register-window", post(api::open_register).delete(api::close_register))
         .route("/api/nodes/order", put(api::reorder_nodes))
+        .route("/api/nodes/batch", put(api::update_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
+        .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
+        .route("/api/version", get(api::versions))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
         .route("/api/themes/{short}/preview", get(api::theme_preview))
         .route("/api/themes/{short}/update", post(api::update_theme))
+        // Not under /api/themes/: a fixed segment there would shadow the theme
+        // of that name for the routes keyed by `{short}`.
+        .route("/api/theme-install", post(api::install_theme))
+        .route("/api/themes/{short}/config", put(api::save_theme_config))
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
@@ -452,6 +540,18 @@ async fn main() -> Result<()> {
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
+                .with_state(app.clone()),
+        )
+        .layer(axum::middleware::map_response(api::plain_errors))
+        // Agents, merged after that layer: `install.sh` and the agent print these
+        // replies beside their own English output, so they are left as written.
+        .merge(
+            Router::new()
+                .route("/api/agent/ws", get(agent_ws::handler))
+                .route("/api/agent/register", post(api::agent_register))
+                .route("/install.sh", get(install_script))
+                .route("/agent/{arch}", get(agent_binary))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
         // Excludes the agent binary and database backups: both are already
@@ -485,6 +585,10 @@ async fn main() -> Result<()> {
     axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;
+    // The readings held back from the traffic rows. Unbooked, they cost nothing
+    // to a node that reports again under the same boot, but a node rebooting
+    // while the hub is down would take them with it.
+    agent_ws::book_held(&held, None);
     Ok(())
 }
 
@@ -502,6 +606,7 @@ async fn shutdown() {
         _ = term.recv() => {}
     }
     info!("shutting down");
+    db::halt();
 }
 
 /// The address printed at startup: `--site` when given, otherwise the listen
@@ -566,6 +671,18 @@ fn host_is_loopback(authority: &str) -> bool {
     host.is_empty() || host == "localhost" || host.parse::<IpAddr>().is_ok_and(|a| a.is_loopback())
 }
 
+/// Whether the hub runs in a Docker or Podman container, which mark each one
+/// with /.dockerenv and /run/.containerenv. The wider signals
+/// (/run/systemd/container, cgroup paths) are not consulted: they also mark
+/// LXC, and a VPS that is itself an LXC container is a bare host for this
+/// purpose.
+///
+/// ponytail: Kubernetes pods carry neither marker and receive the bare-host
+/// advice; checking $KUBERNETES_SERVICE_HOST would cover them.
+fn in_container() -> bool {
+    ["/.dockerenv", "/run/.containerenv"].into_iter().any(|p| std::path::Path::new(p).exists())
+}
+
 /// Prints a one-time admin password when the database is first created, since a
 /// fresh hub is otherwise inaccessible until GitHub is configured.
 fn first_run(app: &App, url: &str) -> Result<()> {
@@ -589,17 +706,34 @@ fn new_password(db: &Db) -> Result<String> {
     Ok(password)
 }
 
+/// Cycles stored under a name. Any other length is stored as `<n>m`; the names
+/// remain because themes built for hub 1.3.0 and earlier recognize only these.
+const NAMED_CYCLES: [(&str, u32); 6] = [
+    ("monthly", 1),
+    ("quarterly", 3),
+    ("semiannual", 6),
+    ("yearly", 12),
+    ("biennial", 24),
+    ("triennial", 36),
+];
+
+/// The longest cycle accepted, in months: 100 years.
+const MAX_CYCLE: u32 = 1_200;
+
 /// Billing cycles as whole months. `once` has none, so it never rolls over.
 fn cycle_months(cycle: &str) -> Option<u32> {
-    Some(match cycle {
-        "monthly" => 1,
-        "quarterly" => 3,
-        "semiannual" => 6,
-        "yearly" => 12,
-        "biennial" => 24,
-        "triennial" => 36,
-        _ => return None,
-    })
+    match NAMED_CYCLES.iter().find(|(name, _)| *name == cycle) {
+        Some(&(_, months)) => Some(months),
+        None => cycle.strip_suffix('m')?.parse().ok().filter(|m| (1..=MAX_CYCLE).contains(m)),
+    }
+}
+
+/// The stored spelling of a cycle of `months`: its name where it has one.
+fn cycle_name(months: u32) -> String {
+    NAMED_CYCLES
+        .iter()
+        .find(|(_, m)| *m == months)
+        .map_or_else(|| format!("{months}m"), |(name, _)| (*name).into())
 }
 
 /// A node still reporting past its expiry date has been renewed, so the date is
@@ -637,21 +771,22 @@ fn renew_online_nodes(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Expires sessions, trims history, rolls over expiry dates and sends the daily
-/// expiry digest, once an hour.
+/// Rolls over expiry dates, expires sessions, sends the daily expiry digest and
+/// folds and trims history: once at startup, then on the hour of the hub's clock.
+///
+/// On the hour because renewal falls due when the hub's date changes. Passes
+/// counted from startup would leave an online node shown expired for up to an
+/// hour after midnight; aligned, the midnight pass rolls it forward within
+/// seconds. A node that comes back online past its expiry date waits for the
+/// next hour.
 async fn housekeeping(app: Shared) {
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3_600));
     loop {
-        ticker.tick().await;
-        let keep = app.db.retention_days();
-        if let Err(e) = app.db.prune(keep) {
-            warn!("pruning history failed: {e:#}");
+        // First, so the midnight pass does not wait on anything below.
+        if let Err(e) = renew_online_nodes(&app) {
+            warn!("rolling expiry dates failed: {e:#}");
         }
         if let Err(e) = app.db.expire_sessions() {
             warn!("expiring sessions failed: {e:#}");
-        }
-        if let Err(e) = renew_online_nodes(&app) {
-            warn!("rolling expiry dates failed: {e:#}");
         }
         // After the roll-over, so the digest lists dates as they now stand.
         match notify::expiry_digest(&app, Local::now()) {
@@ -659,7 +794,35 @@ async fn housekeeping(app: Shared) {
             Ok(None) => {}
             Err(e) => warn!("expiry digest failed: {e:#}"),
         }
+        // Last, and off the runtime: the first pass after an upgrade folds every
+        // hour still held in minute rows and prunes the week's excess, which
+        // takes seconds to minutes. Folding precedes pruning, and pruning runs
+        // even when folding fails: it keeps minute rows until their hour is
+        // folded, and skipping it would leave the database growing.
+        let history = app.clone();
+        let done = tokio::task::spawn_blocking(move || {
+            let keep = history.db.retention_days();
+            match history.db.roll_up(Utc::now().timestamp(), keep) {
+                // More than the hour a pass normally folds is a catch-up, logged
+                // for the disk activity it causes.
+                Ok(folded) if folded > 1 => info!("folded {folded} hours of history into the hourly tier"),
+                Ok(_) => {}
+                Err(e) => warn!("folding history failed: {e:#}"),
+            }
+            history.db.prune(keep)
+        })
+        .await;
+        if let Err(e) = done.map_err(anyhow::Error::from).and_then(|r| r) {
+            warn!("maintaining history failed: {e:#}");
+        }
+        tokio::time::sleep(until_next_hour(Local::now())).await;
     }
+}
+
+/// Time from `now` to the start of the next hour on its clock. Read afresh on
+/// every pass, so a clock step or a daylight-saving change shifts no later one.
+fn until_next_hour<Tz: TimeZone>(now: DateTime<Tz>) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(3_600 - now.minute() * 60 - now.second()))
 }
 
 #[cfg(test)]
@@ -702,9 +865,20 @@ mod tests {
         assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
         // Years overdue: cycles are added until the date is in the future.
         assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
+        // A length without a name rolls the same way.
+        assert_eq!(renewed(d("2026-03-10"), "60m", d("2026-08-28")), Some(d("2031-03-10")));
         // Not yet due, and one-off billing: both left unchanged.
         assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
         assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
+    }
+
+    /// The hour is the local one, which in a half-hour zone is not UTC's.
+    #[test]
+    fn housekeeping_wakes_on_the_local_hour() {
+        let india = chrono::FixedOffset::east_opt(5 * 3_600 + 1_800).unwrap();
+        let at = |h, m, s| until_next_hour(india.with_ymd_and_hms(2026, 9, 23, h, m, s).unwrap()).as_secs();
+        assert_eq!(at(23, 59, 30), 30, "the midnight pass lands as the date changes");
+        assert_eq!(at(10, 0, 0), 3_600);
     }
 
     #[tokio::test]
@@ -839,7 +1013,7 @@ mod tests {
             (1..RELAY_SLOTS).map(|_| RELAY_GATE.try_acquire().expect("up to the limit")).collect();
         let body = metered(Nothing, RELAY_GATE.try_acquire().expect("the last slot"));
         tokio::task::yield_now().await;
-        assert!(RELAY_GATE.try_acquire().is_err(), "the request past the limit must be refused");
+        assert!(RELAY_GATE.try_acquire().is_err(), "every slot is taken");
 
         // A body that ends, or a connection that dies, returns the slot
         // immediately rather than waiting out the deadline.

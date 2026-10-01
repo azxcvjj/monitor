@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -9,11 +9,13 @@ import { Card } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, provisioningSite, trafficCorrection, upload, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
-import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
@@ -29,16 +31,179 @@ const TRAFFIC_MODES: Record<string, string> = {
   down: "仅下行",
 }
 
-// Reordering uses the browser's view transitions, so displaced rows slide.
-// Browsers without support jump instead.
-function animate(update: () => void) {
-  if (document.startViewTransition) document.startViewTransition(() => flushSync(update))
-  else update()
+// Displaced rows slide from where they were drawn to their new place: each is
+// offset back by the distance it moved, then released. Transforms leave layout
+// and stacking alone, so hit-testing mid-slide reads layout positions and the
+// sticky header stays on top. A slide cut short restarts from where it was drawn.
+function slide(rows: HTMLTableSectionElement | null, update: () => void) {
+  const before = new Map([...(rows?.rows ?? [])].map((row) => [row, row.getBoundingClientRect().top]))
+  for (const row of before.keys()) row.getAnimations().forEach((a) => a.id === "slide" && a.cancel())
+  flushSync(update)
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return
+  for (const [row, top] of before) {
+    const dy = top - row.getBoundingClientRect().top
+    if (dy) row.animate({ transform: [`translateY(${dy}px)`, "none"] }, { id: "slide", duration: 150, easing: "ease-out" })
+  }
 }
 
-function copy(text: string) {
+// Drag-to-reorder for a table whose order the hub stores at `/${path}/order`.
+// Rows are displaced while the pointer is down and the whole order is saved on
+// release, so a filtered table must disable its handles: the rows on screen are
+// then not `order`.
+function useDragOrder<T extends { id: number }>(items: T[], path: string, reload: () => void) {
+  const [manualOrder, setManualOrder] = useState<number[]>([])
+  const [dragging, setDragging] = useState<number | null>(null)
+  const orderBeforeDrag = useRef<number[]>([])
+  const body = useRef<HTMLTableSectionElement | null>(null)
+  // One save in flight at a time, so two quick reorders reach the hub in order.
+  const saving = useRef<Promise<unknown>>(Promise.resolve())
+  const byId = new Map(items.map((item) => [item.id, item]))
+  const orderedIds = new Set(manualOrder)
+  const order = [
+    ...manualOrder.map((id) => byId.get(id)).filter((item): item is T => Boolean(item)),
+    ...items.filter((item) => !orderedIds.has(item.id)),
+  ]
+  const ids = () => order.map((item) => item.id)
+
+  // Once the hub lists this order, its list is followed again, so a reorder made
+  // in another tab appears here instead of being overwritten by the next drag.
+  if (dragging === null && manualOrder.length && manualOrder.join() === items.map((item) => item.id).join()) {
+    setManualOrder([])
+  }
+
+  // Handled on the document by layout position, not by the row under the
+  // pointer: a sliding row is drawn away from its place, and the one under the
+  // pointer mid-slide is not the one it would displace. Re-attached on every
+  // render, since `order` changes as rows are displaced.
+  //
+  // Dragenter is accepted as well as dragover: over a new element the browser
+  // fires only dragenter until its next update, and a release in between -- as
+  // when a reorder brings another row under a still pointer -- would otherwise
+  // count as a drop outside and restore the order.
+  useEffect(() => {
+    const rows = body.current
+    if (dragging === null || !rows) return
+    const over = (e: DragEvent) => {
+      // The header row counts as inside: a drag to the top readily overshoots
+      // onto it, and a release there would otherwise discard the drag.
+      const table = rows.parentElement!.getBoundingClientRect()
+      if (e.clientX < table.left || e.clientX > table.right || e.clientY < table.top || e.clientY > table.bottom) return
+      e.preventDefault()
+      if (e.type === "drop") return
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move"
+      const list = [...rows.rows]
+      // Offsets count from the rows' container, which does not slide.
+      const y = e.clientY - list[0].offsetParent!.getBoundingClientRect().top
+      const from = list.findIndex((row) => row.dataset.id === String(dragging))
+      const to = list.findIndex((row) => y >= row.offsetTop && y < row.offsetTop + row.offsetHeight)
+      if (from < 0 || to < 0 || from === to) return
+      // Moved only where the pointer would then rest on the dragged row. Rows
+      // differ in height: a short row moved past a tall one would leave the
+      // tall one under the pointer, and the two would swap back and forth.
+      const target = list[to]
+      const height = list[from].offsetHeight
+      if (to > from ? y < target.offsetTop + target.offsetHeight - height : y >= target.offsetTop + height) return
+      move(dragging, to)
+    }
+    const types = ["dragenter", "dragover", "drop"] as const
+    for (const type of types) document.addEventListener(type, over)
+    return () => {
+      for (const type of types) document.removeEventListener(type, over)
+    }
+  })
+
+  function move(id: number, to: number) {
+    const next = [...ids()]
+    const from = next.indexOf(id)
+    if (from < 0 || to < 0 || to >= next.length || from === to) return
+    next.splice(to, 0, ...next.splice(from, 1))
+    slide(body.current, () => setManualOrder(next))
+    return next
+  }
+
+  // Dropped outside the table or cancelled with Escape: the order is restored.
+  function cancel() {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (before.length) slide(body.current, () => setManualOrder(before))
+  }
+
+  function save(next: number[]) {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (!before.length || next.join() === before.join()) return
+    orderBeforeDrag.current = next
+    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
+    // A refusal falls back to whatever the hub holds, which a save queued
+    // behind it may still change.
+    saving.current = saving.current.then(put).then(reload, (e: Error) => {
+      setManualOrder([])
+      reload()
+      toast.error(e.message)
+    })
+  }
+
+  return {
+    order,
+    row: (id: number) => ({
+      "data-id": id,
+      "data-dragging": dragging === id || undefined,
+      // Opaque, with the dragged row beneath the rest: two rows crossing mid-slide
+      // would otherwise draw their text over each other. No hover tint during a
+      // drag, since the browser keeps it on whichever row reaches the start point.
+      className: `relative z-1 bg-card transition-opacity data-[dragging]:z-0 data-[dragging]:opacity-40 ${dragging === null ? "" : "hover:bg-card"}`,
+    }),
+    handle: (id: number) => ({
+      onDragStart: (e: React.DragEvent<HTMLElement>) => {
+        orderBeforeDrag.current = ids()
+        body.current = e.currentTarget.closest("tbody")
+        setDragging(id)
+        e.dataTransfer.effectAllowed = "move"
+        // Firefox refuses to start a drag without a payload.
+        e.dataTransfer.setData("text/plain", String(id))
+      },
+      onDragEnd: (e: React.DragEvent) => (e.dataTransfer.dropEffect === "none" ? cancel() : save(ids())),
+      onKeyDown: (e: React.KeyboardEvent) => {
+        const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
+        if (!delta) return
+        e.preventDefault()
+        orderBeforeDrag.current = ids()
+        body.current = e.currentTarget.closest("tbody")
+        const next = move(id, ids().indexOf(id) + delta)
+        if (next) save(next)
+      },
+    }),
+  }
+}
+
+function DragHandle({ name, disabled, title = "拖动排序", ...events }: React.ComponentProps<"button"> & { name: string }) {
+  return (
+    <button
+      type="button"
+      draggable={!disabled}
+      disabled={disabled}
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+      title={title}
+      aria-label={`拖动 ${name} 排序`}
+      {...events}
+    >
+      <GripVertical className="size-4" />
+    </button>
+  )
+}
+
+function copy(text: string, done = "已复制") {
+  // navigator.clipboard exists only in a secure context. Over plain http the
+  // copy command still works from a click, the clipboard filled from its event.
+  if (!navigator.clipboard) {
+    const put = (e: ClipboardEvent) => { e.clipboardData?.setData("text/plain", text); e.preventDefault() }
+    document.addEventListener("copy", put)
+    const ok = document.execCommand("copy")
+    document.removeEventListener("copy", put)
+    return ok ? toast.success(done) : toast.error("复制失败")
+  }
   navigator.clipboard.writeText(text).then(
-    () => toast.success("已复制"),
+    () => toast.success(done),
     () => toast.error("复制失败"),
   )
 }
@@ -53,47 +218,110 @@ const SOURCES: Record<Source, string> = {
 // The address a node is reached by, one per family, each click-to-copy: pasting
 // one into an ssh command is why they are shown. Where each came from is in the
 // tooltip, keeping the column to addresses alone.
-function Addresses({ node }: { node: Node }) {
-  const list = addresses(node)
-  if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
-  return (
-    <div className="flex flex-col items-start gap-y-0.5">
-      {list.map(({ address, source }) => (
-        <button
-          key={address}
-          type="button"
-          onClick={() => copy(address)}
-          title={`${SOURCES[source]}。点击复制`}
-          className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
-        >
-          {address}
-          <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
-        </button>
-      ))}
-    </div>
-  )
-}
+//
+// Drawn again only when the addresses change. The table re-renders on every
+// push, and redrawing a tooltip per address would raise the panel's script time
+// at a hundred nodes from 66 to 128 ms a second.
+const Addresses = memo(
+  function Addresses({ list }: { list: NonNullable<Node["addresses"]> }) {
+    if (!list.length) return <span className="text-sm text-muted-foreground">—</span>
+    return (
+      // As wide as the longer address, so both tooltips open from one right
+      // edge and the one for a short IPv4 does not cover the IPv6 below it.
+      <div className="grid w-fit gap-y-0.5">
+        {list.map(({ address, source }) => (
+          // Beside the addresses rather than under one, where it would cover
+          // the other; and gone once the pointer leaves it.
+          <Tooltip key={address} disableHoverableContent>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                // The toast names what was copied: a tap shows no tooltip, and
+                // the cell may show the address shortened.
+                onClick={() => copy(address, `已复制 ${address}`)}
+                aria-label={`复制 ${address}`}
+                className="tnum group inline-flex items-center gap-1 text-sm hover:text-foreground"
+              >
+                {shortAddress(address)}
+                <Copy className="size-3 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" sideOffset={6} className="max-w-xs">
+              <div className="tnum">{address}</div>
+              <div className="opacity-70">{SOURCES[source]}，点击复制</div>
+            </TooltipContent>
+          </Tooltip>
+        ))}
+      </div>
+    )
+  },
+  // Rows arrive as fresh objects on every push, so the list is compared by value.
+  (a, b) => JSON.stringify(a.list) === JSON.stringify(b.list),
+)
 
-// Name, address and country: what a node is looked up by, in every node list.
+// Name, address, country and group: what a node is looked up by, in every node list.
 function searchNodes(nodes: Node[], query: string) {
   const needle = query.trim().toLowerCase()
   if (!needle) return nodes
   return nodes.filter((n) =>
-    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle)))
+    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country, n.group].some((v) => v?.toLowerCase().includes(needle)))
+}
+
+// A filter naming a group no node carries any more -- renamed, or its last node
+// deleted -- falls back to all rather than showing an empty list; so does 未分组
+// once no group is left, since the dropdown that would clear it is hidden then.
+// Reset rather than masked, so the old filter does not return with a later group
+// of the same name.
+function useGroupFilter(nodes: Node[]) {
+  const [filter, setFilter] = useState("all")
+  const valid = filter === "all"
+    || (filter === "none" ? nodes.some((n) => n.group) : nodes.some((n) => n.group === filter.slice(1)))
+  if (!valid) setFilter("all")
+  return [valid ? filter : "all", setFilter] as const
+}
+
+// Offered once some node has a group. 未分组 is where a batch of freshly
+// registered machines waits to be assigned one.
+function GroupFilter({ nodes, value, onChange, className = "" }: {
+  nodes: Node[]
+  value: string
+  onChange: (value: string) => void
+  className?: string
+}) {
+  const groups = groupsOf(nodes)
+  if (!groups.length) return null
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger className={className} aria-label="按分组筛选"><SelectValue /></SelectTrigger>
+      <SelectContent position="popper">
+        <SelectItem value="all">全部分组</SelectItem>
+        {groups.map((g) => <SelectItem key={g} value={`=${g}`}>{g}</SelectItem>)}
+        <SelectItem value="none">未分组</SelectItem>
+      </SelectContent>
+    </Select>
+  )
 }
 
 function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
   return (
     <div className={`relative ${className}`}>
       <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input className="pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+      <Input
+        className="pl-8"
+        placeholder="名称/地址/地区/分组"
+        aria-label="搜索节点"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        // Inside a dialog's form, Enter would otherwise save the dialog.
+        onKeyDown={(e) => e.key === "Enter" && e.preventDefault()}
+      />
     </div>
   )
 }
 
 // Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
-// search narrows what they touch: search JP, then 全选. Offline nodes are dimmed
-// but remain selectable.
+// search or a group narrows what they touch: pick a group, then 全选. Offline
+// nodes are dimmed but remain selectable.
 function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   nodes: Node[]
   chosen: Set<number>
@@ -101,28 +329,31 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   disabled?: boolean
 }) {
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
   // The unfiltered list's height, held as its floor: in a centred dialog a
   // shrinking list would move the search box out from under the cursor.
   const [listHeight, setListHeight] = useState(0)
-  const visible = searchNodes(nodes, query)
+  const visible = inGroup(searchNodes(nodes, query), group)
   const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
   return (
     <div className="rounded-lg border">
-      <div className="flex items-center gap-1 border-b p-2">
-        <NodeSearch className="min-w-0 flex-1" value={query} onChange={setQuery} />
-        <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
-        <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
+      <div className="flex flex-wrap items-center gap-1 border-b p-2">
+        <NodeSearch className="min-w-0 flex-1 basis-40" value={query} onChange={setQuery} />
+        <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+        <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
+        <Button type="button" size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
       </div>
-      {/* Three columns keep a few dozen nodes within one scroll. */}
+      {/* Three columns keep a few dozen nodes within one scroll. A phone gets
+          one: two cut a name to a few characters, and a tap shows no title. */}
       <div
         ref={(el) => { if (el && !listHeight) setListHeight(el.offsetHeight) }}
         // Capped like the height itself, which a min-height would otherwise
         // override once the viewport shrinks.
         style={{ minHeight: listHeight ? `min(${listHeight}px, 16rem, 40dvh)` : undefined }}
-        className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
+        className="grid max-h-[min(16rem,40dvh)] grid-cols-1 content-start gap-0.5 overflow-y-auto p-1.5 min-[480px]:grid-cols-2 sm:grid-cols-3"
       >
         {visible.map((n) => (
-          <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+          <label key={n.id} title={n.group ? `${n.name} · ${n.group}` : n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
             <input type="checkbox" checked={chosen.has(n.id)} disabled={disabled} onChange={(e) => onPick([n], e.target.checked)} className="shrink-0 accent-primary" />
             <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
             {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
@@ -146,13 +377,61 @@ function Command({ className = "", children }: { className?: string; children: R
   )
 }
 
-function Field({ label, hint, className = "", children }: { label: string; hint?: string; className?: string; children: React.ReactNode }) {
+function Field({ label, hint, help, helpWidth, className = "", children }: {
+  label: string
+  hint?: string
+  help?: React.ReactNode
+  helpWidth?: string
+  className?: string
+  children: React.ReactNode
+}) {
+  const title = <Label className="text-sm font-medium">{label}</Label>
   return (
     <div className={`space-y-2 ${className}`}>
-      <Label className="text-sm font-medium">{label}</Label>
+      {help ? <div className="flex items-center gap-1.5">{title}<Help width={helpWidth}>{help}</Help></div> : title}
       {children}
       {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
+  )
+}
+
+// A tap shows no tooltip on its own, so a click opens it as well. The trigger's
+// own handlers would close it on press and on click; both are prevented.
+//
+// `width` is fitted to each text: the narrowest at which its paragraphs take the
+// fewest lines, plus some room for a wider font. A screen too narrow for that
+// gets the narrowest width holding the lines it can fit; capping the wide box
+// at the screen instead would leave its lines well short of the right edge.
+function Help({ children, width = "max-w-64" }: { children: React.ReactNode; width?: string }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <Tooltip open={open} onOpenChange={setOpen}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label="说明"
+          className="text-muted-foreground hover:text-foreground"
+          onPointerDown={(e) => e.preventDefault()}
+          onClick={(e) => {
+            e.preventDefault()
+            setOpen(true)
+          }}
+        >
+          <CircleQuestionMark className="size-3.5" />
+        </button>
+      </TooltipTrigger>
+      {/* text-wrap over the component's text-balance, which breaks multi-line
+          Chinese halfway across the box. Chinese may also break between any
+          two characters, which splits words such as 季付 across lines; kept
+          whole, a line breaks at punctuation and spaces, and mid-run only when
+          a run cannot fit at all. */}
+      <TooltipContent
+        collisionPadding={16}
+        className={`${width} space-y-1 text-left text-wrap break-keep wrap-anywhere`}
+      >
+        {children}
+      </TooltipContent>
+    </Tooltip>
   )
 }
 
@@ -183,6 +462,202 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
 }
 
 
+// Free text, with the groups already in use offered, so a group is picked
+// rather than retyped, where a typo would start a second one. A list of its own
+// rather than a <datalist>: Chrome draws that as a tooltip and filters it by the
+// text already in the box, so a grouped node was offered only its own group.
+// The whole list shows on opening; typing narrows it without highlighting, so
+// Enter keeps a new name that merely prefixes an existing one.
+function GroupInput({ nodes, value, onChange }: {
+  nodes: Pick<Node, "group">[]
+  value: string
+  onChange: (value: string) => void
+}) {
+  const id = useId()
+  const [open, setOpen] = useState(false)
+  const [typed, setTyped] = useState(false)
+  const [active, setActive] = useState(0)
+  const input = useRef<HTMLInputElement>(null)
+  const counts = new Map<string, number>()
+  for (const n of nodes) if (n.group) counts.set(n.group, (counts.get(n.group) ?? 0) + 1)
+  const name = value.trim()
+  const query = typed ? name.toLowerCase() : ""
+  const matches = [...counts.keys()].filter((g) => g.toLowerCase().includes(query))
+  // "" is 未分组, offered last while the list is not being narrowed.
+  const items = query ? matches : [...matches, ""]
+  const fresh = typed && name !== "" && !counts.has(name)
+  const shown = open && (matches.length > 0 || fresh)
+
+  useEffect(() => {
+    if (shown) document.getElementById(`${id}-${active}`)?.scrollIntoView({ block: "nearest" })
+  }, [id, active, shown])
+
+  const show = () => {
+    setTyped(false)
+    setActive(Math.max(0, [...counts.keys(), ""].indexOf(name)))
+    setOpen(true)
+  }
+  const pick = (group: string) => {
+    onChange(group)
+    setTyped(false)
+    setOpen(false)
+  }
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault()
+      if (!shown) return show()
+      if (!items.length) return
+      const down = e.key === "ArrowDown"
+      setActive((i) => (i < 0 ? (down ? 0 : items.length - 1) : (i + (down ? 1 : -1) + items.length) % items.length))
+    } else if (e.key === "Enter" && shown) {
+      e.preventDefault()
+      if (items[active] !== undefined) pick(items[active])
+      else setOpen(false)
+    }
+  }
+
+  if (!counts.size) {
+    return <Input maxLength={13} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
+  }
+  return (
+    <Popover open={shown} onOpenChange={setOpen}>
+      <PopoverAnchor asChild>
+        <div className="relative">
+          <Input
+            ref={input}
+            role="combobox"
+            aria-expanded={shown}
+            aria-controls={id}
+            aria-autocomplete="list"
+            aria-activedescendant={shown && items[active] !== undefined ? `${id}-${active}` : undefined}
+            maxLength={13}
+            value={value}
+            placeholder="未分组"
+            className="pr-9"
+            onChange={(e) => {
+              onChange(e.target.value)
+              setTyped(true)
+              setActive(-1)
+              setOpen(true)
+            }}
+            onClick={show}
+            onKeyDown={onKeyDown}
+          />
+          {/* Not a tab stop, and keeps the focus in the box it opens a list for. */}
+          <button
+            type="button"
+            tabIndex={-1}
+            aria-label="选择分组"
+            className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted-foreground"
+            onMouseDown={(e) => {
+              e.preventDefault()
+              if (shown) return setOpen(false)
+              input.current?.focus()
+              show()
+            }}
+          >
+            <ChevronDown className={`size-4 opacity-50 transition-transform ${shown ? "rotate-180" : ""}`} />
+          </button>
+        </div>
+      </PopoverAnchor>
+      <PopoverContent
+        align="start"
+        className="w-(--radix-popover-trigger-width) p-1"
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        onCloseAutoFocus={(e) => e.preventDefault()}
+        // The box and its button sit outside the list; pressing them is not a dismissal.
+        onInteractOutside={(e) => input.current?.parentElement?.contains(e.target as Element) && e.preventDefault()}
+        onMouseDown={(e) => e.preventDefault()}
+      >
+        <div role="listbox" id={id} aria-label="已有分组" className="max-h-60 overflow-y-auto">
+          {items.map((group, i) => (
+            <div key={group || "\0"}>
+              {group === "" && <div className="my-1 h-px bg-border" />}
+              <div
+                id={`${id}-${i}`}
+                role="option"
+                aria-selected={group === name}
+                onMouseEnter={() => setActive(i)}
+                onClick={() => pick(group)}
+                className={`relative flex cursor-default items-center gap-2 rounded-sm py-1.5 pr-8 pl-2 text-sm select-none ${i === active ? "bg-accent text-accent-foreground" : ""}`}
+              >
+                <span className={`truncate ${group ? "" : "text-muted-foreground"}`}>{group || "未分组"}</span>
+                {group && <span className="tnum ml-auto shrink-0 text-xs text-muted-foreground">{counts.get(group)} 台</span>}
+                {group === name && <Check className="absolute right-2 size-4" />}
+              </div>
+            </div>
+          ))}
+          {fresh && <p className="px-2 py-1.5 text-xs text-muted-foreground">新分组「{name}」，保存后生效</p>}
+        </div>
+      </PopoverContent>
+    </Popover>
+  )
+}
+
+// Puts the nodes ticked here into one group, or, with the name left empty, out
+// of any. Renaming or dissolving a group is the same act: filter the picker to
+// it, tick all, then type the new name or clear it. One request, applied to all
+// of them or none.
+function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: () => void }) {
+  const [name, setName] = useState("")
+  const [chosen, setChosen] = useState<Set<number>>(new Set())
+  const [saving, setSaving] = useState(false)
+  const group = name.trim()
+  // Counted against the live list, so a node deleted meanwhile is not sent.
+  const ids = nodes.filter((n) => chosen.has(n.id)).map((n) => n.id)
+  const pick = (list: Node[], on: boolean) =>
+    setChosen((old) => {
+      const next = new Set(old)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
+      toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>设置分组</DialogTitle>
+          <DialogDescription className="leading-relaxed">
+            勾选节点，设为同一个分组。改名或解散：先筛选出这个分组、全选，再填新名字或清空。
+          </DialogDescription>
+        </DialogHeader>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+          <div className="space-y-4">
+            <Field label="分组名" hint="公开页可见，最多 13 字；留空为移出分组">
+              <GroupInput nodes={nodes} value={name} onChange={setName} />
+            </Field>
+            <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving || !ids.length} className="max-w-full gap-0">
+              <span className="truncate">{group ? `设为「${group}」` : "移出分组"}</span>
+              {ids.length > 0 && <span className="tnum shrink-0">（{ids.length} 台）</span>}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
   title: string
   description: string
@@ -211,7 +686,7 @@ function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose
 
 function CreateNode({ onClose, onSaved }: {
   onClose: () => void
-  onSaved: () => void
+  onSaved: (id: number) => void
 }) {
   const [name, setName] = useState("")
   const [saving, setSaving] = useState(false)
@@ -221,13 +696,13 @@ function CreateNode({ onClose, onSaved }: {
     if (!name.trim()) return toast.error("请填写节点名称")
     setSaving(true)
     try {
-      await api("/nodes", {
+      const { id } = await api<{ id: number }>("/nodes", {
         method: "POST",
         body: JSON.stringify({ name: name.trim() }),
       })
       toast.success("节点已添加")
       onClose()
-      onSaved()
+      onSaved(id)
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -255,13 +730,16 @@ function CreateNode({ onClose, onSaved }: {
   )
 }
 
-function NodeForm({ node, onClose, onSaved }: {
+function NodeForm({ node, nodes, onClose, onSaved }: {
   node: Node
+  nodes: Node[]
   onClose: () => void
   onSaved: () => void
 }) {
   const [form, setForm] = useState(node)
   const [limitGib, setLimitGib] = useState(String(node.traffic_limit / GIB || ""))
+  // Text, as the limit is: a number state turns an emptied box into 0.
+  const [resetDay, setResetDay] = useState(String(node.traffic_reset_day))
   const [saving, setSaving] = useState(false)
   const gib = (bytes: number) => String(Number((bytes / GIB).toFixed(3)))
   const [traffic, setTraffic] = useState(() =>
@@ -272,18 +750,20 @@ function NodeForm({ node, onClose, onSaved }: {
   const pristine = useRef(traffic)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
   // What each address box falls back to when left empty.
-  const automatic = (v6: boolean) =>
-    addresses({ ...node, ipv4_pin: "", ipv6_pin: "" }).find((a) => a.address.includes(":") === v6)?.address ?? "无"
+  const automatic = (v6: boolean) => (v6 ? node.ipv6_auto : node.ipv4_auto) || "无"
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
+    const resetOn = Number(resetDay)
+    if (!Number.isInteger(resetOn) || resetOn < 1 || resetOn > 31) return toast.error("每月重置日要填 1–31 之间的整数")
     const patch = changes(node, {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
-      traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
+      traffic_reset_day: resetOn,
       notify: !!form.notify,
       ipv4_pin: (form.ipv4_pin ?? "").trim(),
       ipv6_pin: (form.ipv6_pin ?? "").trim(),
@@ -322,94 +802,119 @@ function NodeForm({ node, onClose, onSaved }: {
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-6">
-          <section className="space-y-4">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="名称">
-                <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
-              </Field>
-              <Field label="备注">
-                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途，仅管理员可见" />
-              </Field>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <OptionRow title="公开显示" hint="关闭后只在管理后台可见" toggle>
-                <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
-              </OptionRow>
-              <OptionRow title="离线通知" hint="掉线超过宽限期、恢复时各推一条" toggle>
-                <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
-              </OptionRow>
-            </div>
-          </section>
-          <section className="space-y-3 border-t pt-5">
-            <h3 className="text-sm font-medium">流量</h3>
-            <div className="grid gap-4 sm:grid-cols-3">
-              <Field label="每月额度 (GB)" hint="留空或 0 不限">
-                <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
-              </Field>
-              <Field label="计算方式">
-                <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
-                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
-                      <SelectItem key={k} value={k}>{v}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-              <Field label="每月重置日" hint="1–31，改后本月重算，总量不变">
-                <Input type="number" min={1} max={31} value={form.traffic_reset_day} onChange={(e) => set("traffic_reset_day", Number(e.target.value))} />
-              </Field>
-            </div>
-            <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
-              <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
-              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                按 GB 填入需要校正的值，未修改的计数器继续正常累计。
-              </p>
-              <div className="mt-3 grid gap-4 sm:grid-cols-2">
-                {TRAFFIC_FIELDS.map(([key, label]) => (
-                  <Field key={key} label={`${label} (GB)`}>
-                    <Input
-                      type="number"
-                      step="0.001"
-                      value={traffic[key]}
-                      onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
-                    />
-                  </Field>
-                ))}
+        {/* noValidate here and in the other dialogs: save() checks every field.
+            The browser's own check would refuse a fractional GB against the
+            default step of 1, and cannot point at a field folded inside
+            流量校正, so the save button would do nothing. */}
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+          <div className="space-y-6">
+            <section className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="名称">
+                  <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
+                </Field>
+                <Field label="分组" hint="公开页可见，留空为未分组">
+                  <GroupInput nodes={nodes} value={form.group ?? ""} onChange={(v) => set("group", v)} />
+                </Field>
+                <Field label="备注" className="sm:col-span-2">
+                  <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
+                </Field>
               </div>
-            </details>
-          </section>
-          <section className="space-y-3 border-t pt-5">
-            <h3 className="text-sm font-medium">地址与地区</h3>
-            <div className="grid gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
-              <Field label="IPv4">
-                <Input value={form.ipv4_pin ?? ""} onChange={(e) => set("ipv4_pin", e.target.value)} placeholder={`自动：${automatic(false)}`} />
-              </Field>
-              <Field label="IPv6">
-                <Input value={form.ipv6_pin ?? ""} onChange={(e) => set("ipv6_pin", e.target.value)} placeholder={`自动：${automatic(true)}`} />
-              </Field>
-              <Field label="国家/地区">
-                <Input
-                  value={form.country_pin ?? ""}
-                  maxLength={2}
-                  onChange={(e) => set("country_pin", e.target.value.toUpperCase())}
-                  placeholder={`自动：${node.country_auto || "无"}`}
-                />
-              </Field>
-            </div>
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              留空为自动。国家/地区填两位代码，如 CN；手填的值会一直显示，IP 变了要自己改。
-            </p>
-          </section>
-        </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button onClick={save} disabled={saving}>保存</Button>
-        </DialogFooter>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <OptionRow title="公开显示" hint="关闭后只在管理后台可见" toggle>
+                  <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
+                </OptionRow>
+                <OptionRow title="离线通知" hint="掉线超过宽限期、恢复时各推一条" toggle>
+                  <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
+                </OptionRow>
+              </div>
+            </section>
+            <section className="space-y-3 border-t pt-5">
+              <h3 className="text-sm font-medium">流量</h3>
+              {/* On a phone the two short numbers share a row, the mode takes
+                  the next; dense packing restores the order from sm up. */}
+              <div className="grid grid-flow-row-dense grid-cols-2 gap-4 sm:grid-cols-3">
+                <Field label="每月额度 (GB)" hint="留空或 0 不限">
+                  <Input type="number" value={limitGib} onChange={(e) => setLimitGib(e.target.value)} placeholder="1024" />
+                </Field>
+                <Field label="计算方式" className="col-span-2 sm:col-span-1">
+                  <Select value={form.traffic_mode} onValueChange={(v) => set("traffic_mode", v)}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent position="popper">
+                      {Object.entries(TRAFFIC_MODES).map(([k, v]) => (
+                        <SelectItem key={k} value={k}>{v}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+                <Field label="每月重置日" hint="1–31，改后本月重算，总量不变">
+                  <Input type="number" min={1} max={31} value={resetDay} onChange={(e) => setResetDay(e.target.value)} />
+                </Field>
+              </div>
+              <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
+                <summary className="cursor-pointer text-sm font-medium">流量校正</summary>
+                <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                  按 GB 填入需要校正的值，未修改的计数器继续正常累计。
+                </p>
+                <div className="mt-3 grid grid-cols-2 gap-4">
+                  {TRAFFIC_FIELDS.map(([key, label]) => (
+                    <Field key={key} label={`${label} (GB)`}>
+                      <Input
+                        type="number"
+                        step="0.001"
+                        value={traffic[key]}
+                        onChange={(e) => setTraffic((t) => ({ ...t, [key]: e.target.value }))}
+                      />
+                    </Field>
+                  ))}
+                </div>
+              </details>
+            </section>
+            <section className="space-y-3 border-t pt-5">
+              <h3 className="text-sm font-medium">地址与地区</h3>
+              <div className="grid grid-flow-row-dense grid-cols-[1fr_5rem] gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
+                <Field label="IPv4">
+                  <Input value={form.ipv4_pin ?? ""} onChange={(e) => set("ipv4_pin", e.target.value)} placeholder={`自动：${automatic(false)}`} />
+                </Field>
+                <Field label="IPv6" className="col-span-full sm:col-span-1">
+                  <Input value={form.ipv6_pin ?? ""} onChange={(e) => set("ipv6_pin", e.target.value)} placeholder={`自动：${automatic(true)}`} />
+                </Field>
+                <Field label="国家/地区">
+                  <Input
+                    value={form.country_pin ?? ""}
+                    maxLength={2}
+                    onChange={(e) => set("country_pin", e.target.value.toUpperCase())}
+                    placeholder={`自动：${node.country_auto || "无"}`}
+                  />
+                </Field>
+              </div>
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                留空为自动。国家/地区填两位代码，如 CN；手填的值会一直显示，IP 变了要自己改。
+              </p>
+            </section>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )
+}
+
+const CURRENCY_NAMES = new Intl.DisplayNames(["zh-CN"], { type: "currency" })
+
+// The name confirms a code the hub can only check the shape of. DisplayNames
+// echoes back a code outside ISO 4217 and throws on anything but three letters,
+// which the hub refuses with its own message.
+function currencyHint(code: string) {
+  try {
+    const name = CURRENCY_NAMES.of(code)
+    return name === code ? "未知代码，照原样显示" : name
+  } catch {
+    return undefined
+  }
 }
 
 function BillingForm({ node, onClose, onSaved }: {
@@ -421,10 +926,17 @@ function BillingForm({ node, onClose, onSaved }: {
   // Text rather than a number: a numeric state cannot represent an empty field,
   // so clearing it would snap back to 0 mid-entry. Empty means free.
   const [price, setPrice] = useState(node.price > 0 ? String(node.price) : "")
+  // Whole years are entered in years, the way a five-year plan is sold.
+  const months = cycleMonths(node.billing_cycle)
+  const [unit, setUnit] = useState(months === 0 ? "once" : months % 12 ? "months" : "years")
+  const [count, setCount] = useState(String(months % 12 ? months : months / 12 || 1))
   const [saving, setSaving] = useState(false)
   const set = <K extends keyof Node>(k: K, v: Node[K]) => setForm((f) => ({ ...f, [k]: v }))
 
   async function save() {
+    // The hub refuses a length out of range and stores a named one by name, so
+    // an unchanged length is compared in months, not in spelling.
+    const cycle = unit === "once" ? "once" : `${Number(count) * (unit === "years" ? 12 : 1)}m`
     setSaving(true)
     try {
       await api(`/nodes/${node.id}`, {
@@ -432,7 +944,7 @@ function BillingForm({ node, onClose, onSaved }: {
         body: JSON.stringify(changes(node, {
           price: Math.max(0, Number(price) || 0),
           currency: form.currency,
-          billing_cycle: form.billing_cycle,
+          billing_cycle: cycleMonths(cycle) === months ? node.billing_cycle : cycle,
           expires_at: form.expires_at || null,
         })),
       })
@@ -452,49 +964,82 @@ function BillingForm({ node, onClose, onSaved }: {
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-5">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="价格" hint="留空或 0 为免费">
-              <Input
-                type="number"
-                min="0"
-                step="0.01"
-                value={price}
-                onChange={(e) => setPrice(e.target.value)}
-                placeholder="免费"
-              />
-            </Field>
-            <Field label="货币">
-              <Select value={form.currency} onValueChange={(v) => set("currency", v)}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {["USD", "CNY", "EUR", "GBP", "JPY"].map((c) => (
-                    <SelectItem key={c} value={c}>{c}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+          <div className="space-y-5">
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="价格" hint="留空或 0 为免费">
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={price}
+                  onChange={(e) => setPrice(e.target.value)}
+                  placeholder="免费"
+                />
+              </Field>
+              <Field
+                label="货币"
+                hint={currencyHint(form.currency.toUpperCase())}
+                helpWidth="max-w-72"
+                help={
+                  <>
+                    <p>填三个字母的货币代码，大小写都行。</p>
+                    <p>
+                      例如：
+                      {["美元 USD", "人民币 CNY", "港币 HKD", "新台币 TWD", "欧元 EUR", "日元 JPY"].map((c, i) => (
+                        <span key={c}>{i > 0 && "、"}<span className="whitespace-nowrap">{c}</span></span>
+                      ))}
+                    </p>
+                  </>
+                }
+              >
+                {/* Uppercased by CSS: rewriting the value mid-composition would
+                    break an input method, and the hub stores it uppercased. */}
+                <Input
+                  maxLength={3}
+                  autoCapitalize="characters"
+                  spellCheck={false}
+                  className="uppercase"
+                  value={form.currency}
+                  onChange={(e) => set("currency", e.target.value)}
+                  placeholder="USD"
+                />
+              </Field>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <Field label="付款周期">
+                <div className="flex gap-2">
+                  {unit !== "once" && (
+                    <Input
+                      type="number"
+                      min="1"
+                      step="1"
+                      aria-label="周期长度"
+                      className="w-16"
+                      value={count}
+                      onChange={(e) => setCount(e.target.value)}
+                    />
+                  )}
+                  <Select value={unit} onValueChange={setUnit}>
+                    <SelectTrigger className="min-w-0 flex-1"><SelectValue /></SelectTrigger>
+                    <SelectContent position="popper">
+                      <SelectItem value="months">月</SelectItem>
+                      <SelectItem value="years">年</SelectItem>
+                      <SelectItem value="once">一次性</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </Field>
+              <Field label="到期时间">
+                <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
+              </Field>
+            </div>
           </div>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="付款周期">
-              <Select value={form.billing_cycle} onValueChange={(v) => set("billing_cycle", v)}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {Object.entries(CYCLES).map(([k, v]) => (
-                    <SelectItem key={k} value={k}>{v}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="到期时间">
-              <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
-            </Field>
-          </div>
-        </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button onClick={save} disabled={saving}>保存</Button>
-        </DialogFooter>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )
@@ -511,8 +1056,14 @@ function scriptCommand(site: string, args: (site: string) => string[]) {
 // Built here rather than fetched: the node list already carries the token, so
 // viewing an install command is a read rather than an action. Reissuing one to
 // display it would take the running agent offline.
-function installCommand(site: string, token: string, seconds: number, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, `--interval ${seconds}`, ...ifaceArg(iface)])
+function installCommand(site: string, token: string, seconds: number | undefined, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--token ${token}`, ...intervalArg(seconds), ...ifaceArg(iface)])
+}
+
+// Left out untouched, as an untouched --iface is: a rerun then keeps what the
+// machine already has.
+function intervalArg(seconds: number | undefined) {
+  return seconds === undefined ? [] : [`--interval ${seconds}`]
 }
 
 // '' is how install.sh is told to clear a value it would otherwise keep; a
@@ -524,15 +1075,38 @@ function ifaceArg(iface: string | undefined) {
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
-// used directly in a loop.
-function registerCommand(site: string, key: string, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...ifaceArg(iface)])
+// sent to every machine as it is.
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...intervalArg(seconds), ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
 // node is deleted.
 function uninstallCommand(site: string) {
   return scriptCommand(site, () => ["--uninstall"])
+}
+
+// Also the same for every node: install.sh reads the token and the hub address
+// from the machine's own env file.
+function upgradeCommand(site: string) {
+  return scriptCommand(site, () => ["--upgrade"])
+}
+
+export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean }
+
+/**
+ * What is running and what is published. Read once per panel load: the hub holds
+ * the answer for six hours, so this costs a GitHub lookup a few times a day at
+ * most, and nothing at all while nobody opens the panel.
+ *
+ * A hub that cannot reach github.com answers with empty latest fields, which
+ * render as no update rather than as an error.
+ */
+function useVersions() {
+  const [versions, setVersions] = useState<Versions | null>(null)
+  const load = useCallback(() => api<Versions>("/version").then(setVersions).catch(() => {}), [])
+  useEffect(() => { load() }, [load])
+  return { versions, reload: load }
 }
 
 // The window lives on the hub; this reads it back and counts down, which is also
@@ -581,7 +1155,8 @@ function RegisterDialog({ site, reg, onClose }: {
   onClose: () => void
 }) {
   const iface = useIfaceOption(undefined)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, iface.flag) : ""
+  const interval = useIntervalOption()
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.flag, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -594,10 +1169,11 @@ function RegisterDialog({ site, reg, onClose }: {
           {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
             {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
-              "名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
+              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以同时发给多台机器。"}
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
           </section>
           {reg.left > 0 ? (
@@ -606,6 +1182,18 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
+              {/* Per machine, so it cannot be part of the one command. */}
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                <a
+                  className="ml-1 underline underline-offset-2 hover:text-foreground"
+                  href="https://monitor-document.pages.dev/install/batch"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  批量执行的做法
+                </a>
+              </p>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
               </OptionRow>
@@ -622,6 +1210,43 @@ function RegisterDialog({ site, reg, onClose }: {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// The reporting interval both install dialogs offer, opening on the node's
+// current one where the hub has read it from the reports. `flag` stays
+// undefined until the field is changed, including back to what it opened on.
+function useIntervalOption(current?: number | null) {
+  const [typed, setTyped] = useState<string>()
+  const text = typed ?? String(current ?? 1)
+  const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
+  return { typed: text, setTyped, current, flag: typed === undefined ? undefined : seconds }
+}
+
+function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
+  return (
+    <OptionRow
+      title="上报间隔"
+      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时可以调大" : (
+        <>
+          1–3600 秒，默认 1 秒。不改动时沿用机器上原有的间隔
+          {option.current && <span className="mt-0.5 block">当前：{option.current} 秒</span>}
+        </>
+      )}
+    >
+      <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
+        {/* Text rather than number: no spinner arrows, and no wheel changing
+            the value under a passing scroll. */}
+        <Input
+          inputMode="numeric"
+          value={option.typed}
+          onChange={(e) => option.setTyped(e.target.value.replace(/\D/g, ""))}
+          aria-label="上报间隔（秒）"
+          className="tnum h-8 w-20 bg-background text-right"
+        />
+        秒
+      </span>
+    </OptionRow>
   )
 }
 
@@ -692,13 +1317,12 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onRotated: () => void
 }) {
   const [token, setToken] = useState(node.token ?? "")
-  const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
+  const interval = useIntervalOption(node.interval)
 
-  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token && iface.valid ? installCommand(site, token, seconds, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.flag, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)
@@ -720,24 +1344,14 @@ function InstallDialog({ node, site, onClose, onRotated }: {
       <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{node.name}</DialogTitle>
+          {/* The one place a single node's agent version is shown, and what an
+              issue report asks for. Empty until the node has reported once. */}
+          {node.agent_version && <DialogDescription>当前 agent v{node.agent_version}</DialogDescription>}
         </DialogHeader>
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
-            <OptionRow title="上报间隔" hint="1–3600 秒，默认 1 秒">
-              <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
-                {/* Text rather than number: no spinner arrows, and no wheel
-                    changing the value under a passing scroll. */}
-                <Input
-                  inputMode="numeric"
-                  value={interval}
-                  onChange={(e) => setInterval(e.target.value.replace(/\D/g, ""))}
-                  aria-label="上报间隔（秒）"
-                  className="tnum h-8 w-20 bg-background text-right"
-                />
-                秒
-              </span>
-            </OptionRow>
+            <IntervalOption option={interval} />
             <IfaceOption option={iface} />
           </section>
           <section className="space-y-2 border-t pt-5">
@@ -775,7 +1389,40 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
+// Width in ems, near enough: a CJK character is one, anything else about half.
+const ems = (word: string) => [...word].reduce((n, c) => n + (c > "\u2e7f" ? 1 : 0.55), 0)
+
+// A node name, broken at its spaces and after the dots of a hostname --
+// registered nodes are named after theirs. A word up to eight ems stays whole,
+// a city, a label or a hyphenated one such as GIA-E, where the browser would
+// leave its last letter to open the next line. A wider word, as a name typed
+// without spaces usually is, breaks between its CJK characters, and a run of
+// letters only where nothing else fits: kept whole, it would set the column's
+// minimum width and push the table past the screen. A separator such as the ·
+// in 香港 09 · DMIT, or a dash, is held to the word before it, so no line opens
+// with one.
+function nameText(name: string) {
+  return name
+    .replace(/ (?=[·|/｜—–-] )/g, "\u00a0")
+    .split(/( )/)
+    .map((word, i) => {
+      const parts = word.split(".").flatMap((part, j) => (j ? [".", <wbr key={j} />, part] : [part]))
+      if (ems(word) > 8) return <span key={i} className="wrap-anywhere [word-break:normal]">{parts}</span>
+      return word.includes("-") ? <span key={i} className="whitespace-nowrap">{word}</span> : parts
+    })
+}
+
+// Traffic turns a subdued orange at the alert threshold and a subdued red once
+// the allowance is used up, so the table agrees with the alerts. With alerts
+// off, the threshold's default of 80 % still marks a node running short.
+function trafficTone(n: Node, warnAt: number) {
+  if (n.traffic_limit <= 0) return ""
+  if (n.month_used >= n.traffic_limit) return "text-over"
+  return n.month_used * 100 >= n.traffic_limit * warnAt ? "text-near" : ""
+}
+
 function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
+  const warnAt = Number(useSettings().s?.notify_traffic) || 80
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -784,20 +1431,21 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
-  const [manualOrder, setManualOrder] = useState<number[]>([])
   const [query, setQuery] = useState("")
-  const [dragging, setDragging] = useState<number | null>(null)
-  const orderBeforeDrag = useRef<number[]>([])
-  const byId = new Map(nodes.map((node) => [node.id, node]))
-  const orderedIds = new Set(manualOrder)
-  const order = [
-    ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
-    ...nodes.filter((node) => !orderedIds.has(node.id)),
-  ]
-  // `order` itself stays whole, because the order sent on drop is the order of
-  // every node.
-  const visible = searchNodes(order, query)
-  const searching = query.trim() !== ""
+  const [group, setGroup] = useGroupFilter(nodes)
+  const [grouping, setGrouping] = useState(false)
+  // A new node lands last, a hundred rows down on a large fleet, so it is
+  // brought into view once the list carries it. A filter hiding it cancels the
+  // scroll rather than leaving one to fire when the filter is cleared.
+  const added = useRef<number | null>(null)
+  const drag = useDragOrder(nodes, "nodes", refresh)
+  const visible = inGroup(searchNodes(drag.order, query), group)
+  useEffect(() => {
+    if (added.current === null || !nodes.some((n) => n.id === added.current)) return
+    document.querySelector(`tbody tr[data-id="${added.current}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" })
+    added.current = null
+  })
+  const searching = query.trim() !== "" || group !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
 
   async function remove() {
@@ -815,39 +1463,17 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     }
   }
 
-  // Rows are displaced while the pointer is down; the order is saved on drop.
-  function move(from: number, to: number) {
-    if (from < 0 || to < 0 || to >= order.length || from === to) return
-    const next = [...order]
-    next.splice(to, 0, ...next.splice(from, 1))
-    const ids = next.map((node) => node.id)
-    animate(() => setManualOrder(ids))
-    return ids
-  }
-
-  // Dropped outside the table or cancelled with Escape: the order is restored.
-  function cancel() {
-    setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (rollback.length) animate(() => setManualOrder(rollback))
-  }
-
-  function save(ids: number[]) {
-    setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (!rollback.length || ids.join() === rollback.join()) return
-    orderBeforeDrag.current = ids
-    api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) }).then(refresh, (e: Error) => {
-      setManualOrder(rollback)
-      toast.error(e.message)
-    })
-  }
-
   return (
     <div className="space-y-4">
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
+        <div className="mr-auto flex w-full gap-2 sm:w-auto">
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+        </div>
+        <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
+          <Layers /> 分组
+        </Button>
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
@@ -864,98 +1490,98 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             {/* Percentages, or the address column swallows every spare pixel
                 and pushes status across the table. */}
             <TableRow>
-              <TableHead className="w-[20%]">名称</TableHead>
-              <TableHead className="w-[22%]">IP</TableHead>
+              <TableHead className="w-[26%]">名称</TableHead>
+              <TableHead className="w-[18%]">IP</TableHead>
               <TableHead className="w-[12%]">状态</TableHead>
               <TableHead className="w-[16%]">流量</TableHead>
-              <TableHead className="w-[10%]">价格</TableHead>
-              <TableHead className="w-[12%]">到期</TableHead>
+              {/* Below xl the expiry date moves under the price: seven
+                  columns leave a 1024px window no room for names. */}
+              <TableHead className="w-[10%]">价格<span className="xl:hidden"> / 到期</span></TableHead>
+              <TableHead className="hidden w-[12%] xl:table-cell">到期</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {visible.map((n, index) => (
-              <TableRow
-                key={n.id}
-                style={{ viewTransitionName: `node-${n.id}` }}
-                data-dragging={dragging === n.id || undefined}
-                className="transition-opacity data-[dragging]:opacity-40"
-                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move" }}
-                onDragEnter={() => dragging !== null && move(order.findIndex((node) => node.id === dragging), index)}
-                onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
-              >
-                <TableCell>
+            {visible.map((n) => (
+              <TableRow key={n.id} {...drag.row(n.id)}>
+                {/* Wraps: under the cell's default nowrap, one long name would
+                    widen the table until the actions left the screen. */}
+                <TableCell className="whitespace-normal">
                   <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      draggable={!searching}
-                      // A drop sends the order of every node, and a filtered list
-                      // offers only its own rows to drop onto, so the index below
-                      // is the full one exactly while nothing is filtered out.
+                    <DragHandle
+                      {...drag.handle(n.id)}
+                      name={n.name}
                       disabled={searching}
-                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-                      title={searching ? "清空搜索后可拖动排序" : "拖动排序"}
-                      aria-label={`拖动 ${n.name} 排序`}
-                      onDragStart={(e) => {
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        setDragging(n.id)
-                        e.dataTransfer.effectAllowed = "move"
-                        // Firefox refuses to start a drag without a payload.
-                        e.dataTransfer.setData("text/plain", String(n.id))
-                      }}
-                      onDragEnd={(e) => (e.dataTransfer.dropEffect === "none" ? cancel() : save(order.map((node) => node.id)))}
-                      onKeyDown={(e) => {
-                        const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
-                        if (!delta) return
-                        e.preventDefault()
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        const ids = move(index, index + delta)
-                        if (ids) save(ids)
-                      }}
-                    >
-                      <GripVertical className="size-4" />
-                    </button>
-                    <div className="min-w-0 font-medium">{n.name}</div>
-                    {n.country && (
-                      <Badge
-                        variant="outline"
-                        title={n.country_pin ? "手动指定" : undefined}
-                        className="shrink-0 font-normal text-muted-foreground"
-                      >
-                        {n.country}
-                      </Badge>
-                    )}
+                      title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
+                    />
+                    <div className="min-w-24">
+                      {/* Lines are balanced, so none ends on a character or two. */}
+                      <div className="font-medium text-balance break-keep">
+                        {nameText(n.name)}
+                        {/* In the name's flow, a fixed gap after its last word.
+                            Beside the block it would sit at the cell's edge
+                            whenever the name or group wraps, since a wrapped
+                            block spans the whole width. The gap is a figure
+                            space, which does not break: the badge moves down
+                            with the last word rather than open a line alone. */}
+                        {n.country && "\u2007"}
+                        {n.country && (
+                          <Badge
+                            variant="outline"
+                            title={n.country_pin ? "手动指定" : undefined}
+                            className="align-middle font-normal text-muted-foreground"
+                          >
+                            {n.country}
+                          </Badge>
+                        )}
+                      </div>
+                      {n.group && <div className="text-xs text-balance text-muted-foreground">{n.group}</div>}
+                    </div>
                   </div>
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}
                 <TableCell>
-                  <Addresses node={n} />
+                  <Addresses list={n.addresses ?? []} />
                 </TableCell>
                 <TableCell>
-                  <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
-                    {n.online ? "在线" : "离线"}
-                  </Badge>
-                  {!n.public && <Badge variant="outline" className="ml-1 font-normal">不公开</Badge>}
-                  {/* Under the badge, not inside it: the column is a tenth of
-                      the table and the three do not share one line. */}
-                  {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
-                    <div className="tnum mt-1 text-xs text-muted-foreground">
-                      {uptime(Date.now() / 1000 - n.last_seen)}
-                    </div>
-                  )}
+                  {/* Stacked and centred on one axis. The slot is as wide as
+                      the three-character 不公开, so a lone pill sits where it
+                      would above that one and every row lines up. */}
+                  <div className="flex w-fit min-w-14 flex-col items-center gap-1">
+                    <Badge variant={n.online ? "default" : "secondary"} className="font-normal">
+                      {n.online ? "在线" : "离线"}
+                    </Badge>
+                    {!n.public && <Badge variant="outline" className="font-normal">不公开</Badge>}
+                    {/* Under the badge, not inside it: the column is a tenth of
+                        the table and the three do not share one line. A slot of
+                        the pills' width that the text spills out of evenly, so a
+                        long duration does not widen the slot and move the
+                        pills off the axis the other rows share. */}
+                    {!n.online && n.last_seen > 0 && Date.now() / 1000 - n.last_seen >= 60 && (
+                      <div className="flex w-14 justify-center">
+                        <span className="tnum text-xs whitespace-nowrap text-muted-foreground">
+                          {uptime(Date.now() / 1000 - n.last_seen)}
+                        </span>
+                      </div>
+                    )}
+                  </div>
                 </TableCell>
                 {/* Counted by the node's own billing rule, as on the public
-                    page. */}
-                <TableCell className="tnum text-sm">
-                  {bytes(n.month_used)}
-                  <span className="text-muted-foreground">
-                    {" / "}{n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
+                    page. Two unbreakable halves, so a narrow table moves the
+                    limit to a second line rather than splitting a figure. */}
+                <TableCell className="tnum text-sm whitespace-normal">
+                  <span className={`whitespace-nowrap ${trafficTone(n, warnAt)}`}>
+                    {bytes(n.month_used)}
+                  </span>{" "}
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    / {n.traffic_limit > 0 ? bytes(n.traffic_limit) : FOREVER}
                   </span>
                 </TableCell>
                 <TableCell className="tnum text-sm">
                   {n.price > 0 ? money(n.price, n.currency) : "免费"}
+                  <div className="text-xs text-muted-foreground xl:hidden">{n.expires_at || FOREVER}</div>
                 </TableCell>
-                <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
+                <TableCell className="hidden text-sm xl:table-cell">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
@@ -993,16 +1619,18 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {creating && (
         <CreateNode
           onClose={() => setCreating(false)}
-          onSaved={refresh}
+          onSaved={(id) => { added.current = id; refresh() }}
         />
       )}
       {editing && (
         <NodeForm
           node={editing}
+          nodes={nodes}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
       )}
+      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={refresh} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
@@ -1054,6 +1682,8 @@ function PingForm({ task, nodes, onClose, onSaved }: {
   onSaved: () => void
 }) {
   const [form, setForm] = useState(task)
+  // Text until saved, so the box can be emptied and retyped.
+  const [every, setEvery] = useState(String(task.interval ?? 60))
   const [saving, setSaving] = useState(false)
   // The assignments as the hub holds them, as far as this dialog can tell: those
   // loaded, plus any node that registers while it is open, which an auto_join
@@ -1084,11 +1714,14 @@ function PingForm({ task, nodes, onClose, onSaved }: {
 
   async function save() {
     if (!form.name?.trim() || !form.target?.trim()) return toast.error("请填写名称和目标")
+    const interval = Number(every)
+    if (!Number.isInteger(interval) || interval < 5 || interval > 3600) return toast.error("间隔要填 5–3600 之间的整数秒")
     setSaving(true)
     try {
       // `base` limits the save to what was ticked or unticked here; a node that
       // joined through auto_join while the dialog was open keeps its assignment.
-      await api("/ping-tasks", { method: "POST", body: JSON.stringify(task.id ? { ...form, base: base.current } : form) })
+      const body = { ...form, interval, ...(task.id ? { base: base.current } : {}) }
+      await api("/ping-tasks", { method: "POST", body: JSON.stringify(body) })
       toast.success("已保存，正在下发")
       onClose()
       onSaved()
@@ -1105,54 +1738,64 @@ function PingForm({ task, nodes, onClose, onSaved }: {
         <DialogHeader>
           <DialogTitle>{task.id ? "编辑监控" : "添加监控"}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-6">
-          {/* On a phone the name takes the first row and the target shares the
-              second with the interval, so the tab order matches the screen. */}
-          <section className="grid grid-cols-[1fr_6rem] gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
-            <Field label="名称" className="col-span-full sm:col-span-1">
-              {/* A new monitor starts empty, so the cursor belongs here;
-                  editing an existing one starts with nothing selected. */}
-              <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
-            </Field>
-            <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
-              <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
-            </Field>
-            <Field label="间隔（秒）" hint="5–3600">
-              {/* An emptied number box reads back as "", and Number("") is 0,
-                  which the hub refuses. */}
-              <Input type="number" min="5" max="3600" value={form.interval ?? 60} onChange={(e) => setForm({ ...form, interval: Number(e.target.value) || 60 })} />
-            </Field>
-          </section>
-          <section className="space-y-3 border-t pt-5">
-            <div className="flex items-baseline justify-between gap-2">
-              <h3 className="text-sm font-medium">运行节点</h3>
-              <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
-            </div>
-            <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
-            <OptionRow title="新节点自动加入" hint="以后添加的节点自动运行此监控" toggle>
-              <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
-            </OptionRow>
-          </section>
-        </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button onClick={save} disabled={saving}>保存</Button>
-        </DialogFooter>
+        <form noValidate className="contents" onSubmit={(e) => { e.preventDefault(); save() }}>
+          <div className="space-y-6">
+            {/* On a phone the name takes the first row and the target shares the
+                second with the interval, so the tab order matches the screen. */}
+            <section className="grid grid-cols-[1fr_6rem] gap-4 sm:grid-cols-[1fr_1.4fr_6rem]">
+              <Field label="名称" className="col-span-full sm:col-span-1">
+                {/* A new monitor starts empty, so the cursor belongs here;
+                    editing an existing one starts with nothing selected. */}
+                <Input autoFocus={!task.id} value={form.name ?? ""} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Cloudflare" />
+              </Field>
+              <Field label="目标地址" hint="host:port，每个节点各自 TCP 连接">
+                <Input value={form.target ?? ""} onChange={(e) => setForm({ ...form, target: e.target.value })} placeholder="1.1.1.1:443" />
+              </Field>
+              <Field label="间隔（秒）" hint="5–3600">
+                <Input type="number" min="5" max="3600" value={every} onChange={(e) => setEvery(e.target.value)} />
+              </Field>
+            </section>
+            <section className="space-y-3 border-t pt-5">
+              <div className="flex items-baseline justify-between gap-2">
+                <h3 className="text-sm font-medium">运行节点</h3>
+                <span className="tnum text-xs text-muted-foreground">已选 {chosenCount} / {nodes.length}</span>
+              </div>
+              <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
+              <OptionRow title="新节点自动加入" hint="以后添加的节点自动运行此监控" toggle>
+                <Switch checked={!!form.auto_join} onCheckedChange={(v) => setForm({ ...form, auto_join: v })} />
+              </OptionRow>
+            </section>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )
 }
 
 function Ping({ nodes }: { nodes: Node[] }) {
-  const [tasks, setTasks] = useState<PingTask[]>([])
+  // null until loaded, so the empty state does not flash before the list.
+  const [tasks, setTasks] = useState<PingTask[] | null>(null)
   const [editing, setEditing] = useState<Partial<PingTask> | null>(null)
   const [deleting, setDeleting] = useState<PingTask | null>(null)
   const [removing, setRemoving] = useState(false)
 
-  const load = () => api<{ tasks: PingTask[] }>("/ping-tasks").then((d) => setTasks(d.tasks)).catch(() => {})
+  // A failed first load draws the page empty, keeping 添加监控 in reach.
+  const load = () =>
+    api<{ tasks: PingTask[] }>("/ping-tasks")
+      .then((d) => setTasks(d.tasks))
+      .catch((e: Error) => {
+        toast.error(e.message)
+        setTasks((tasks) => tasks ?? [])
+      })
   // A node added or removed changes assignments on the hub: auto_join adds, a
   // deletion cascades.
   useEffect(() => { load() }, [nodes.length])
+  // Unfiltered, so the handles are never disabled.
+  const drag = useDragOrder(tasks ?? [], "ping-tasks", load)
 
   async function remove() {
     if (!deleting) return
@@ -1169,6 +1812,7 @@ function Ping({ nodes }: { nodes: Node[] }) {
     }
   }
 
+  if (!tasks) return null
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
@@ -1189,9 +1833,14 @@ function Ping({ nodes }: { nodes: Node[] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {tasks.map((t) => (
-              <TableRow key={t.id}>
-                <TableCell className="font-medium">{t.name}</TableCell>
+            {drag.order.map((t) => (
+              <TableRow key={t.id} {...drag.row(t.id)}>
+                <TableCell className="font-medium">
+                  <div className="flex items-center gap-2">
+                    <DragHandle {...drag.handle(t.id)} name={t.name} />
+                    {t.name}
+                  </div>
+                </TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
                 <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
@@ -1243,6 +1892,178 @@ type Theme = {
   // 内置主题在二进制里，没有目录可删。装上一份同名的会顶替它，那一份就是普通
   // 主题，删掉之后内置的重新顶上。
   builtin: boolean
+  // theme.json 里声明的设置表单，原样转过来，由 configFields 挑出能画的字段。
+  config?: unknown
+  // 主题包是否带 preview.png，由 hub 告知，卡片的高度一次排定，不因图片晚到而改变。
+  preview: boolean
+}
+
+// 主题在 theme.json 里声明的设置。hub 只存与默认值不同的项，其余由主题用自己的默认值补上，
+// 所以主题作者日后改了某个默认值，没动过这一项的站点会跟着变。
+//
+// 字段不多时是一列；多了改成宽对话框：按分组标题分节，左侧切换，右侧两列，
+// 否则几十项排成一条细长的列表。有改动的节在导航上带一个点。
+function ThemeSettings({ theme, saved, onClose }: {
+  theme: Theme
+  saved: Record<string, unknown>
+  onClose: () => void
+}) {
+  const form = configForm(theme.config)
+  const fields = form.filter((entry): entry is ConfigField => entry.type !== "title")
+  const sections = configSections(form)
+  const large = fields.length > 6
+  const paged = large && sections.length > 1
+  const [current, setCurrent] = useState(0)
+  const [values, setValues] = useState(() => configValues(fields, saved))
+  // What the save builds on. Keys the form does not declare are kept, except
+  // after 恢复默认: that also clears them, the only way from the panel to drop
+  // a value, publicly readable, left by a field the theme has since removed.
+  const [base, setBase] = useState(saved)
+  const [saving, setSaving] = useState(false)
+  const set = (key: string, value: unknown) => setValues((old) => ({ ...old, [key]: value }))
+  const label = (field: ConfigField) => field.label || field.key
+  // A number box holds its text while being edited; an empty one holds no
+  // number, where Number("") would read as 0.
+  const typed = (f: ConfigField) =>
+    f.type !== "number" ? values[f.key] : values[f.key] === "" ? NaN : Number(values[f.key])
+  const differs = (f: ConfigField) => typed(f) !== f.default
+
+  async function save(e: React.FormEvent) {
+    e.preventDefault()
+    // The browser checks required/min/max only on the boxes on screen; a
+    // section switched away from is no longer rendered, so its numbers are
+    // checked here and the offending one brought back into view.
+    const invalid = fields.find((f) => f.type === "number" && !fits(f, typed(f)))
+    if (invalid) {
+      setCurrent(Math.max(0, sections.findIndex((section) => section.fields.includes(invalid))))
+      const range =
+        invalid.min !== undefined && invalid.max !== undefined ? `${invalid.min}–${invalid.max} 之间的`
+        : invalid.min !== undefined ? `不小于 ${invalid.min} 的`
+        : invalid.max !== undefined ? `不大于 ${invalid.max} 的` : ""
+      return toast.error(`「${label(invalid)}」要填${range}数字`)
+    }
+    setSaving(true)
+    try {
+      await api(`/themes/${theme.short}/config`, {
+        method: "PUT",
+        body: JSON.stringify(configOverrides(fields, base, Object.fromEntries(fields.map((f) => [f.key, typed(f)])))),
+      })
+      toast.success("主题设置已保存，公开页刷新后生效")
+      onClose()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const input = (field: ConfigField) =>
+    field.type === "boolean" ? (
+      <OptionRow key={field.key} title={label(field)} hint={field.help} toggle>
+        <Switch checked={values[field.key] as boolean} onCheckedChange={(v) => set(field.key, v)} />
+      </OptionRow>
+    ) : (
+      <Field key={field.key} label={label(field)} hint={field.help} className={large && field.type === "text" ? "sm:col-span-2" : ""}>
+        {field.type === "text" ? (
+          <textarea
+            rows={4}
+            className={`${TEXT_BOX} text-sm`}
+            value={values[field.key] as string}
+            onChange={(e) => set(field.key, e.target.value)}
+          />
+        ) : field.type === "select" ? (
+          <Select value={values[field.key] as string} onValueChange={(v) => set(field.key, v)}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent position="popper">
+              {field.options!.map((o) => (
+                <SelectItem key={o.value} value={o.value}>{o.label || o.value}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : field.type === "number" ? (
+          <Input
+            type="number"
+            required
+            step="any"
+            min={field.min}
+            max={field.max}
+            value={String(values[field.key])}
+            onChange={(e) => set(field.key, e.target.value)}
+          />
+        ) : (
+          <Input value={values[field.key] as string} onChange={(e) => set(field.key, e.target.value)} />
+        )}
+      </Field>
+    )
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        onOpenAutoFocus={(e) => e.preventDefault()}
+        className={large ? "flex h-[min(46rem,calc(100dvh-2rem))] flex-col overflow-hidden sm:max-w-4xl" : "sm:max-w-lg"}
+      >
+        <DialogHeader>
+          <DialogTitle>{theme.name} 设置</DialogTitle>
+        </DialogHeader>
+        <form className="flex min-h-0 flex-1 flex-col gap-4" onSubmit={save}>
+          <div className="flex min-h-0 flex-1 flex-col gap-4 sm:flex-row">
+            {paged && (
+              <nav className="-mx-1 flex shrink-0 gap-1 overflow-x-auto px-1 pb-1 sm:mx-0 sm:w-48 sm:flex-col sm:overflow-y-auto sm:px-0">
+                {sections.map((section, index) => (
+                  <button
+                    key={index}
+                    type="button"
+                    aria-current={index === current}
+                    onClick={() => setCurrent(index)}
+                    className={`flex shrink-0 items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm transition-colors ${
+                      index === current ? "bg-muted font-medium" : "text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                    }`}
+                  >
+                    <span className="whitespace-nowrap sm:whitespace-normal">{section.label}</span>
+                    {section.fields.some(differs) && (
+                      <span className="ml-auto size-1.5 shrink-0 rounded-full bg-primary" title="有改动" />
+                    )}
+                  </button>
+                ))}
+              </nav>
+            )}
+            <div className={`min-h-0 flex-1 ${large ? "overflow-y-auto pr-1" : ""}`}>
+              <div className={`grid items-start gap-4 ${large ? "sm:grid-cols-2" : ""}`}>
+                {paged
+                  ? sections[current].fields.map(input)
+                  : form.map((entry, index) =>
+                      entry.type === "title" ? (
+                        <h3 key={`title-${index}`} className={`pt-2 text-sm font-semibold first:pt-0 ${large ? "sm:col-span-2" : ""}`}>
+                          {entry.label}
+                        </h3>
+                      ) : (
+                        input(entry)
+                      ),
+                    )}
+              </div>
+            </div>
+          </div>
+          {/* One row on a phone as well: stacked, the three buttons would take a
+              third of the height the fields have. */}
+          <DialogFooter className="flex-row items-center border-t pt-4">
+            <Button
+              type="button"
+              variant="ghost"
+              className="mr-auto"
+              onClick={() => {
+                setValues(Object.fromEntries(fields.map((f) => [f.key, f.default])))
+                setBase({})
+              }}
+            >
+              {paged ? "全部恢复默认" : "恢复默认"}
+            </Button>
+            <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
+            <Button type="submit" disabled={saving}>保存</Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function Themes() {
@@ -1250,6 +2071,8 @@ function Themes() {
   const [busy, setBusy] = useState("")
   const [doomed, setDoomed] = useState<Theme | null>(null)
   const [zoomed, setZoomed] = useState<Theme | null>(null)
+  const [configuring, setConfiguring] = useState<{ theme: Theme; saved: Record<string, unknown> } | null>(null)
+  const [repo, setRepo] = useState("")
   const picker = useRef<HTMLInputElement>(null)
 
   const load = () =>
@@ -1266,13 +2089,15 @@ function Themes() {
     }
   }
 
-  async function install(file: File) {
-    setBusy("upload")
+  // Both ways in answer with the installed manifest.
+  async function install(how: "upload" | "github", installing: () => Promise<{ theme: Theme }>) {
+    setBusy(how)
     try {
-      const { theme } = await upload<{ theme: Theme }>("/themes", file)
+      const { theme } = await installing()
       // The hub reads a theme from disk on every request, so it is already live;
       // reloading the list only brings this page up to date.
       toast.success(`已安装 ${theme.name} ${theme.version}`)
+      if (how === "github") setRepo("")
       load()
     } catch (e) {
       toast.error((e as Error).message)
@@ -1301,6 +2126,16 @@ function Themes() {
     }
   }
 
+  // Read on opening rather than inside the dialog, so the form starts from what
+  // is saved instead of flashing the defaults first.
+  async function configure(theme: Theme) {
+    try {
+      setConfiguring({ theme, saved: await api(`/themes/${theme.short}/config`) })
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
+  }
+
   async function remove(theme: Theme) {
     setBusy("delete")
     try {
@@ -1320,18 +2155,48 @@ function Themes() {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <div>
-          <h3 className="text-sm font-medium">安装主题</h3>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            上传主题作者发布的 <code>theme.tar.gz</code>，同名主题整体替换。
-            <br />
-            主题的 <code>url</code> 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 从它最新的
-            release 取 <code>theme.tar.gz</code>，版本没变就不下载。
-            <br />
-            主题代码在访客浏览器中执行，请只安装可信来源。
-          </p>
+          <div className="flex items-center gap-1.5">
+            <h3 className="text-sm font-medium">安装主题</h3>
+            <Help width="max-w-64 min-[480px]:max-w-112">
+              <p>填主题的 GitHub 仓库地址，例如 <span className="whitespace-nowrap">https://github.com/作者/仓库</span></p>
+              <p>仓库首页、Releases 页的地址都可以，总是安装最新的 release。</p>
+              <p>也可以上传 release 里的 theme.tar.gz，不要选 Source code。</p>
+              <p>两种方式都是同名主题整体替换。</p>
+              <p>
+                主题的 url 指向 GitHub 仓库时，卡片上的 <RefreshCw className="inline size-3" /> 检查更新，版本没变就不下载。
+              </p>
+            </Help>
+          </div>
+          {/* Stays in view: it is the one line about what installing permits. */}
+          <p className="mt-1 text-xs text-muted-foreground">主题代码在访客浏览器中执行，请只安装可信来源。</p>
         </div>
-        <div>
-          <Button size="sm" disabled={!!busy} onClick={() => picker.current?.click()}>
+        <form
+          className="flex flex-wrap gap-2"
+          onSubmit={(e) => {
+            e.preventDefault()
+            install("github", () =>
+              api("/theme-install", { method: "POST", body: JSON.stringify({ url: repo.trim() }) }),
+            )
+          }}
+        >
+          {/* text rather than url: the browser's own validation would answer
+              in its language before the hub's message could. */}
+          <Input
+            value={repo}
+            onChange={(e) => setRepo(e.target.value)}
+            disabled={!!busy}
+            inputMode="url"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            placeholder="主题 GitHub 仓库地址"
+            aria-label="主题 GitHub 仓库地址"
+            className="h-8 flex-1 basis-60"
+          />
+          <Button size="sm" type="submit" disabled={!!busy || !repo.trim()}>
+            <Download /> {busy === "github" ? "安装中…" : "从 GitHub 安装"}
+          </Button>
+          <Button size="sm" type="button" variant="outline" disabled={!!busy} onClick={() => picker.current?.click()}>
             <Upload /> {busy === "upload" ? "安装中…" : "上传主题包"}
           </Button>
           <input
@@ -1342,37 +2207,27 @@ function Themes() {
             onChange={(e) => {
               const file = e.target.files?.[0]
               e.target.value = ""
-              if (file) install(file)
+              if (file) install("upload", () => upload<{ theme: Theme }>("/themes", file))
             }}
           />
-        </div>
+        </form>
       </Card>
 
       {/* items-start：有预览图和没有的卡片不该为了等高而留白 */}
       <div className="grid items-start gap-3 sm:grid-cols-2">
         {themes.map((theme) => (
           <Card key={theme.short} className="gap-4 p-5">
-            {/* 主题包里可选的 preview.png，所以后端不用告诉前端有没有这张图：
-                没有就是 404，图一直不显示。hidden 挂在 <a> 上而不是 <img> 上——
-                隐藏的是整个链接，否则卡片里留着一个高度为 0 却照样吃 gap-4 的空
-                链接。必须从 hidden 开始：带边框的 aspect-video 空盒子会在响应回
-                来之前就画出来，闪一下再消失。
-                缩略图被压到卡片那点宽度，比例不是 16:9 的还会被 object-cover
+            {/* 缩略图被压到卡片那点宽度，比例不是 16:9 的还会被 object-cover
                 裁掉边，所以图本身要能点开看原尺寸——就地开一个对话框，不跳走。 */}
-            <button
-              type="button"
-              title="查看完整预览图"
-              hidden
-              className="cursor-zoom-in"
-              onClick={() => setZoomed(theme)}
-            >
-              <img
-                src={`/api/themes/${theme.short}/preview`}
-                alt={`${theme.name} 预览图`}
-                onLoad={(e) => { e.currentTarget.parentElement!.hidden = false }}
-                className="aspect-video w-full rounded-md border object-cover object-top"
-              />
-            </button>
+            {theme.preview && (
+              <button type="button" title="查看完整预览图" className="cursor-zoom-in" onClick={() => setZoomed(theme)}>
+                <img
+                  src={`/api/themes/${theme.short}/preview`}
+                  alt={`${theme.name} 预览图`}
+                  className="aspect-video w-full rounded-md border object-cover object-top"
+                />
+              </button>
+            )}
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
@@ -1386,11 +2241,17 @@ function Themes() {
                 <Button size="sm" variant={theme.selected ? "secondary" : "default"} disabled={theme.selected} onClick={() => select(theme.short)}>
                   {theme.selected ? "使用中" : "使用"}
                 </Button>
+                {configFields(theme.config).length > 0 && (
+                  <Button size="icon" variant="ghost" title="主题设置" aria-label="主题设置" onClick={() => configure(theme)}>
+                    <SlidersHorizontal />
+                  </Button>
+                )}
                 {updatable(theme) && (
                   <Button
                     size="icon"
                     variant="ghost"
                     title="从 GitHub 更新"
+                    aria-label="从 GitHub 更新"
                     disabled={!!busy}
                     onClick={() => update(theme)}
                   >
@@ -1401,7 +2262,7 @@ function Themes() {
                     directory to delete -- it is also the fallback everything
                     else lands on. */}
                 {!theme.builtin && (
-                  <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => setDoomed(theme)}>
+                  <Button size="icon" variant="ghost" title="删除主题" aria-label="删除主题" disabled={!!busy} onClick={() => setDoomed(theme)}>
                     <Trash2 />
                   </Button>
                 )}
@@ -1433,6 +2294,8 @@ function Themes() {
         </Dialog>
       )}
 
+      {configuring && <ThemeSettings {...configuring} onClose={() => setConfiguring(null)} />}
+
       {doomed && (
         <ConfirmDialog
           title={`删除 ${doomed.name}？`}
@@ -1462,13 +2325,20 @@ function useSettings() {
   return {
     s,
     set: (k: string, v: string) => setS((old) => ({ ...(old ?? {}), [k]: v })),
-    save: async (patch: Record<string, string>) => {
+    // Resolves to whether the hub took the patch; a failure is already toasted.
+    save: async (patch: Record<string, string>, done = "已保存") => {
       try {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
-        toast.success("已保存")
-        // Only the saved keys and the `*_set` flags are taken from the hub: a
-        // credential comes back as a flag, so the typed value must not linger,
-        // while another card's unsaved edits on the same page must survive.
+      } catch (e) {
+        toast.error((e as Error).message)
+        return false
+      }
+      toast.success(done)
+      // Only the saved keys and the `*_set` flags are taken from the hub: a
+      // credential comes back as a flag, so the typed value must not linger,
+      // while another card's unsaved edits on the same page must survive. A
+      // failed read leaves the form as typed; the save itself stands.
+      try {
         const fresh = await api<Settings>("/settings")
         setS((old) => {
           const next = { ...old }
@@ -1479,11 +2349,13 @@ function useSettings() {
       } catch (e) {
         toast.error((e as Error).message)
       }
+      return true
     },
   }
 }
 
-function SettingsTab() {
+// `onSaved` refreshes what the header shows, the site name among it.
+function SettingsTab({ onSaved }: { onSaved: () => void }) {
   const { s, set, save } = useSettings()
   if (!s) return null
 
@@ -1494,12 +2366,30 @@ function SettingsTab() {
           <Field label="站点名称">
             <Input value={String(s.site_name ?? "")} onChange={(e) => set("site_name", e.target.value)} placeholder="Monitor" />
           </Field>
-          <Field label="历史数据保留天数" hint="超出的明细自动清理，累计流量不受影响">
+          <Field
+            label="历史数据保留天数"
+            hint="1–365 天，超出的自动清理，累计流量不受影响"
+            helpWidth="max-w-66 min-[408px]:max-w-94"
+            help={
+              <>
+                <p>
+                  默认 <span className="whitespace-nowrap">30 天</span>，能看约一个月的历史。
+                </p>
+                <p>
+                  最近 <span className="whitespace-nowrap">7 天</span>
+                  {"按分钟保存，更早的按小时保存：超过一周的图表上，两者画出来几乎一样，按小时存只占几十分之一的空间。"}
+                </p>
+                <p>
+                  上限 <span className="whitespace-nowrap">365 天</span>。
+                </p>
+              </>
+            }
+          >
             <Input
               type="number"
               value={String(s.retention_days ?? "")}
               onChange={(e) => set("retention_days", e.target.value)}
-              placeholder="7"
+              placeholder="30"
             />
           </Field>
           <Field
@@ -1532,10 +2422,10 @@ function SettingsTab() {
                 // `||` rather than `??`: the hub returns "" for an unset key
                 // rather than null, and "" is the one value this key's write path
                 // refuses.
-                retention_days: String(s.retention_days || "7"),
+                retention_days: String(s.retention_days || "30"),
                 github_proxy: String(s.github_proxy ?? ""),
                 public_page: s.public_page === "off" ? "off" : "on",
-              })
+              }).then((ok) => ok && onSaved())
             }
           >
             保存站点设置
@@ -1546,8 +2436,9 @@ function SettingsTab() {
   )
 }
 
-const TEXTAREA =
-  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+const TEXT_BOX =
+  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+const TEXTAREA = `${TEXT_BOX} font-mono text-xs`
 
 // One offline alert, filled in the way the hub fills a template: in a single pass,
 // JSON-escaped for the webhook body. Previews only; nothing here is sent.
@@ -1606,36 +2497,63 @@ function ChannelCard({ title, configured, children }: { title: string; configure
 }
 
 // Offline alerts are opt-in per node, so turning them on for a fleet needs one
-// place rather than one dialog per node.
+// place rather than one dialog per node. Ticks are a draft until 保存, like every
+// other form in the panel: a request per click would make each tick wait on a
+// round trip and a refresh before showing.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [busy, setBusy] = useState(false)
+  // Only the ticks changed here, by node id. A snapshot of every node's state
+  // would send back a node another session switched meanwhile.
+  const [draft, setDraft] = useState<Map<number, boolean>>(new Map())
+  const [saving, setSaving] = useState(false)
+  const on = (n: Node) => draft.get(n.id) ?? !!n.notify
+  const chosen = new Set(nodes.filter(on).map((n) => n.id))
+  // Against the live list, so a node deleted meanwhile is neither counted nor sent.
+  const turnOn = nodes.filter((n) => on(n) && !n.notify).map((n) => n.id)
+  const turnOff = nodes.filter((n) => !on(n) && n.notify).map((n) => n.id)
+  const dirty = turnOn.length + turnOff.length > 0
 
-  async function apply(targets: Node[], on: boolean) {
-    setBusy(true)
+  // Kept after a save until the list reports it, so the ticks do not flash back
+  // to the old state for a round trip. Adjusted during render rather than in an
+  // effect, as it follows from props alone.
+  if (draft.size && !dirty && !saving) setDraft(new Map())
+
+  const pick = (list: Node[], value: boolean) =>
+    setDraft((old) => {
+      const next = new Map(old)
+      for (const n of list) next.set(n.id, value)
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
     try {
-      // Awaited in turn, the requests would cost one round trip per node, and
-      // the two-second stream would render each one as it lands.
-      await Promise.all(
-        targets
-          .filter((n) => !!n.notify !== on)
-          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
-      )
+      for (const [ids, on] of [[turnOn, true], [turnOff, false]] as const) {
+        if (ids.length) await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { notify: on } }) })
+      }
+      toast.success("离线通知已保存")
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       refresh()
-      setBusy(false)
+      setSaving(false)
     }
   }
 
-  const enabled = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
+  const pending = [turnOn.length && `打开 ${turnOn.length} 台`, turnOff.length && `关闭 ${turnOff.length} 台`].filter(Boolean)
   return (
     <Card className="gap-4 p-5">
       <div>
         <h3 className="text-sm font-medium">离线通知</h3>
-        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          按节点打开，默认关。已打开 {nodes.filter((n) => n.notify).length} / {nodes.length} 台
+          {pending.length > 0 && <span className="text-foreground">，待保存：{pending.join("、")}</span>}
+        </p>
       </div>
-      <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
+      <NodePicker nodes={nodes} chosen={chosen} onPick={pick} disabled={saving} />
+      <div className="flex justify-end gap-2">
+        <Button size="sm" variant="ghost" disabled={!dirty || saving} onClick={() => setDraft(new Map())}>撤销</Button>
+        <Button size="sm" disabled={!dirty || saving} onClick={save}>保存</Button>
+      </div>
     </Card>
   )
 }
@@ -1712,7 +2630,7 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             保存 Telegram
           </Button>
           {s.notify_telegram_token_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_telegram_token: "", notify_telegram_chat: "" })}>
+            <Button size="sm" variant="ghost" onClick={() => save({ notify_telegram_token: "", notify_telegram_chat: "" }, "已清除 Telegram")}>
               清除
             </Button>
           )}
@@ -1750,12 +2668,12 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
             保存 Webhook
           </Button>
           {s.notify_webhook_headers_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_headers: "" })}>
+            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_headers: "" }, "已清除请求头")}>
               清除请求头
             </Button>
           )}
           {s.notify_webhook_url_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_url: "", notify_webhook_headers: "" })}>
+            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_url: "", notify_webhook_headers: "" }, "已清除 Webhook")}>
               清除
             </Button>
           )}
@@ -1805,19 +2723,33 @@ function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
 // and the password that works when GitHub does not.
 type Session = { id: string; current: boolean; created_at: number }
 
-function Sessions() {
+function useSessions() {
   const [rows, setRows] = useState<Session[] | null>(null)
-  const [busy, setBusy] = useState("")
+  // A failed load leaves the list empty rather than absent: the security page
+  // waits for it, and the password card must stay reachable.
+  const load = useCallback(
+    () =>
+      api<Session[]>("/sessions")
+        .then(setRows)
+        .catch((e: Error) => {
+          toast.error(e.message)
+          setRows((rows) => rows ?? [])
+        }),
+    [],
+  )
+  useEffect(() => { load() }, [load])
+  return { rows, load }
+}
 
-  const load = () => api<Session[]>("/sessions").then(setRows).catch((e: Error) => toast.error(e.message))
-  useEffect(() => { load() }, [])
+function Sessions({ rows, reload }: { rows: Session[]; reload: () => void }) {
+  const [busy, setBusy] = useState("")
 
   async function remove(id: string) {
     setBusy(id)
     try {
       await api(`/sessions/${id}`, { method: "DELETE" })
       toast.success("已删除会话")
-      load()
+      reload()
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
@@ -1825,7 +2757,6 @@ function Sessions() {
     }
   }
 
-  if (!rows) return null
   return (
     <Card className="gap-4 p-5">
       <div>
@@ -1838,13 +2769,13 @@ function Sessions() {
         {rows.map((s) => (
           <div key={s.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
             <div className="flex min-w-0 items-center gap-2 text-sm">
-              <span className="tnum">{new Date(s.created_at * 1000).toLocaleString()}</span>
+              <span className="tnum">{new Date(s.created_at * 1000).toLocaleString("zh-CN")}</span>
               {s.current && <Badge variant="secondary">当前设备</Badge>}
             </div>
             {/* 当前会话没有删除按钮：右上角的退出登录做的就是这件事，而在这里删
                 只会让已经渲染好的面板以为自己还登着。 */}
             {!s.current && (
-              <Button size="icon" variant="ghost" disabled={!!busy} onClick={() => remove(s.id)}>
+              <Button size="icon" variant="ghost" title="删除会话" aria-label="删除会话" disabled={!!busy} onClick={() => remove(s.id)}>
                 <Trash2 />
               </Button>
             )}
@@ -1857,19 +2788,22 @@ function Sessions() {
 
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
+  const sessions = useSessions()
   const [password, setPassword] = useState("")
-  if (!s) return null
+  // Drawn once both have arrived, so the list does not land late above the
+  // cards and push them down.
+  if (!s || !sessions.rows) return null
   const callback = `${site}/api/auth/github/callback`
 
   return (
     <div className="space-y-4">
-      <Sessions />
+      <Sessions rows={sessions.rows} reload={sessions.load} />
 
       <Card className="gap-4 p-5">
         <div>
           <h3 className="text-sm font-medium">GitHub 单点登录</h3>
           <p className="mt-1 text-xs text-muted-foreground">
-            OAuth App 回调地址 <code className="rounded bg-muted px-1">{callback}</code>
+            OAuth App 回调地址 <code className="rounded bg-muted px-1 break-all">{callback}</code>
           </p>
         </div>
         <div className="grid gap-4 sm:grid-cols-2">
@@ -1877,7 +2811,13 @@ function Security({ site }: { site: string }) {
             <Input value={String(s.github_client_id ?? "")} onChange={(e) => set("github_client_id", e.target.value)} />
           </Field>
           <Field label="Client Secret" hint={s.github_secret_set ? "已设置，留空不变" : "未设置"}>
-            <Input type="password" placeholder={s.github_secret_set ? "••••••••" : ""} onChange={(e) => set("github_client_secret", e.target.value)} />
+            <Input
+              type="password"
+              autoComplete="off"
+              placeholder={s.github_secret_set ? "••••••••" : ""}
+              value={String(s.github_client_secret ?? "")}
+              onChange={(e) => set("github_client_secret", e.target.value)}
+            />
           </Field>
         </div>
         {String(s.github_client_id ?? "") !== "" && String(s.github_allowed_users ?? "").trim() === "" && (
@@ -1921,7 +2861,8 @@ function Security({ site }: { site: string }) {
           <Button
             size="sm"
             disabled={password.length < 12}
-            onClick={() => save({ admin_password: password }).then(() => setPassword(""))}
+            // Every other session ends with the change, so the list is read again.
+            onClick={() => save({ admin_password: password }, "密码已修改").then((ok) => { if (ok) { setPassword(""); sessions.load() } })}
           >
             修改密码
           </Button>
@@ -1942,11 +2883,13 @@ type DbInfo = {
   rows: Record<string, number>
 }
 
-// The only two tables whose row count indicates anything about size. Every other
-// holds one row per node or per key.
+// The only tables whose row count indicates anything about size, each kind of
+// history in both tiers. Every other holds one row per node or per key.
 const DB_ROWS: [string, string][] = [
   ["metric", "历史明细"],
+  ["metric_hour", "历史小时汇总"],
   ["ping_record", "延迟记录"],
+  ["ping_hour", "延迟小时汇总"],
 ]
 
 function Data() {
@@ -2000,8 +2943,8 @@ function Data() {
   }
 
   if (!info) return null
-  const stat = (label: string, value: string) => (
-    <div key={label}>
+  const stat = (label: string, value: string, className = "") => (
+    <div key={label} className={className}>
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="tnum mt-0.5 text-sm">{value}</div>
     </div>
@@ -2011,10 +2954,13 @@ function Data() {
     <div className="space-y-4">
       <Card className="gap-4 p-5">
         <h3 className="text-sm font-medium">数据库</h3>
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        {/* Five columns: the file and the window on one row, the four row counts
+            on the next. On two columns the free space takes a row of its own, so
+            the window and each kind's two tiers still pair up. */}
+        <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
           {stat("文件大小", bytes(info.size))}
           {stat("预写日志", bytes(info.wal))}
-          {stat("可回收空间", bytes(info.free))}
+          {stat("可回收空间", bytes(info.free), "col-span-2 sm:col-span-1")}
           {stat("保留天数", `${info.retention} 天`)}
           {/* 和保留天数并排：跨度小于保留期是还没攒够，大于保留期就是每小时
               那次 prune 没在跑。 */}
@@ -2030,8 +2976,7 @@ function Data() {
         <div>
           <h3 className="text-sm font-medium">回收空间</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            按保留天数清掉过期明细，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。
-            重建期间需要与数据库等量的空闲磁盘，过程中面板和上报会短暂变慢。
+            清掉超出保留天数的历史，再重建数据库文件把空出来的页还给磁盘（SQLite 的 VACUUM）。重建期间需要约为数据库两倍的空闲磁盘，过程中面板和上报会短暂变慢。
           </p>
         </div>
         <div>
@@ -2045,8 +2990,7 @@ function Data() {
         <div>
           <h3 className="text-sm font-medium">备份</h3>
           <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，
-            当前节点、设置、历史全部作废，所有设备需要重新登录。
+            导出的是整个数据库，含节点凭证与登录密码哈希，请当作密钥保管。恢复会用备份文件整体覆盖当前数据，当前节点、设置、历史全部作废，所有设备需要重新登录。
             <br />
             请用这里导出的文件恢复：直接复制 <code>monitor.db</code> 会丢掉预写日志里还没落盘的那部分。
           </p>
@@ -2078,8 +3022,8 @@ function Data() {
       {confirm === "vacuum" && (
         <ConfirmDialog
           title="回收空间？"
-          description="超出保留天数的历史明细会被删除，然后重建数据库文件。累计流量不受影响。"
-          confirmLabel="开始回收"
+          description="超出保留天数的历史会被删除，然后重建数据库文件。累计流量不受影响。"
+          confirmLabel={busy === "vacuum" ? "回收中…" : "开始回收"}
           busy={!!busy}
           onClose={() => setConfirm(null)}
           onConfirm={vacuum}
@@ -2099,6 +3043,178 @@ function Data() {
   )
 }
 
+const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+
+/** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
+function VersionPair({ current, latest }: { current: string; latest: string }) {
+  if (!behind(current, latest)) {
+    return <span className="text-xs text-muted-foreground">{latest ? `已是最新 v${current}` : `当前 v${current}`}</span>
+  }
+  return (
+    <span className="text-xs text-muted-foreground">
+      v{current} <span className="px-0.5">→</span>
+      <span className="ml-0.5 font-medium text-foreground">v{latest}</span>
+    </span>
+  )
+}
+
+/** Outdated nodes grouped by the version they run, oldest first. */
+function byVersion(nodes: Node[]): [string, Node[]][] {
+  const groups = new Map<string, Node[]>()
+  for (const n of nodes) groups.set(n.agent_version, [...(groups.get(n.agent_version) ?? []), n])
+  return [...groups].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+}
+
+/**
+ * What is published for the hub and the agents. Its own route rather than a
+ * banner on the node list; the dot in the navigation is what says there is
+ * something here.
+ *
+ * The hub card names the release alone: how to take it depends on how the hub
+ * was installed, script or container, which the hub cannot tell.
+ */
+function Update({ versions, reload, nodes, site, refusal }: {
+  versions: Versions | null
+  reload: () => void
+  nodes: Node[]
+  site: string
+  refusal: string
+}) {
+  const [saving, setSaving] = useState(false)
+  if (!versions) return null
+  const outdated = outdatedAgents(nodes, versions.agent_latest)
+  const offline = outdated.filter((n) => !n.online).length
+  const upgrade = refusal ? "" : upgradeCommand(site)
+  const unreachable = !versions.hub_latest && !versions.agent_latest
+
+  // Applied on the spot: one switch, and the navigation changes with it.
+  async function setNotice(on: boolean) {
+    setSaving(true)
+    try {
+      await api("/settings", { method: "PUT", body: JSON.stringify({ update_notice: on ? "on" : "off" }) })
+      reload()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      {unreachable && (
+        <Card className="p-5">
+          <p className="text-sm text-muted-foreground">
+            查不到最新版本：这台 hub 连不上 api.github.com。GitHub 代理不作用于这一项。
+          </p>
+        </Card>
+      )}
+
+      <Card className="gap-4 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-medium">hub</h3>
+          <div className="flex items-center gap-3">
+            <VersionPair current={versions.hub} latest={versions.hub_latest} />
+            {behind(versions.hub, versions.hub_latest) && (
+              <Button size="sm" variant="ghost" asChild>
+                <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
+                  发布说明
+                </a>
+              </Button>
+            )}
+          </div>
+        </div>
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-medium">agent</h3>
+          <span className="text-xs text-muted-foreground">
+            {versions.agent_latest
+              ? outdated.length
+                ? <>最新 v{versions.agent_latest} · <span className="font-medium text-foreground">{outdated.length} 台待升级</span></>
+                : `全部已是最新 v${versions.agent_latest}`
+              : "查不到版本"}
+          </span>
+        </div>
+        {/* Also where the lookup failed: the command does not depend on it, and a
+            hub that fetches agents through the GitHub proxy cannot read tags. */}
+        {(outdated.length > 0 || !versions.agent_latest) && (
+          <>
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建节点。
+            </p>
+            {upgrade ? (
+              <>
+                <Command>{upgrade}</Command>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="secondary" onClick={() => copy(upgrade)}>
+                    <Copy className="size-4" /> 复制命令
+                  </Button>
+                  {versions.agent_latest && (
+                    <Button size="sm" variant="ghost" asChild>
+                      <a href={releaseUrl("agent", versions.agent_latest)} target="_blank" rel="noreferrer">
+                        发布说明
+                      </a>
+                    </Button>
+                  )}
+                  <Button size="sm" variant="ghost" asChild>
+                    <a href="https://monitor-document.pages.dev/install/batch" target="_blank" rel="noreferrer">
+                      批量升级的做法
+                    </a>
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-muted-foreground">{refusal}</p>
+            )}
+            {/* Collapsed until asked for, grouped by version, and bounded in height
+                once open, so any number of nodes stays one line on the page. */}
+            {outdated.length > 0 && (
+              <details className="group border-t pt-3">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md text-xs text-muted-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
+                  <span className="flex items-center gap-1.5">
+                    <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
+                    待升级的节点
+                  </span>
+                  {offline > 0 && <span>其中 {offline} 台离线</span>}
+                </summary>
+                <div className="mt-3 max-h-60 space-y-3 overflow-auto">
+                  {byVersion(outdated).map(([version, group]) => (
+                    <div key={version} className="space-y-1.5">
+                      <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {group.map((n) => (
+                          <Badge
+                            key={n.id}
+                            variant="secondary"
+                            className={`font-normal ${n.online ? "" : "opacity-50"}`}
+                            title={n.online ? undefined : "离线"}
+                          >
+                            {n.name}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </>
+        )}
+      </Card>
+
+      <OptionRow
+        title="更新提醒"
+        hint="有新版本时在导航的「更新」旁显示小圆点。关闭只是不再显示圆点，这一页照常检查"
+        toggle
+      >
+        <Switch checked={versions.notice} disabled={saving} onCheckedChange={setNotice} />
+      </OptionRow>
+    </div>
+  )
+}
+
 // Each area is its own route rather than a tab, so a page can be linked to and a
 // reload returns to the same section.
 const ADMIN_SECTIONS = [
@@ -2109,6 +3225,7 @@ const ADMIN_SECTIONS = [
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
   { path: "/admin/settings", label: "设置", icon: Settings },
+  { path: "/admin/update", label: "更新", icon: ArrowUpCircle },
 ] as const
 
 export function Admin({
@@ -2118,6 +3235,7 @@ export function Admin({
   refresh,
   site,
   refusal,
+  reloadMe,
 }: {
   path: string
   go: (to: string) => void
@@ -2125,7 +3243,14 @@ export function Admin({
   refresh: () => void
   site: string
   refusal: string
+  reloadMe: () => void
 }) {
+  const { versions, reload } = useVersions()
+  // One dot for both; the page separates them. Absent when switched off on that
+  // page, or when the lookup failed and the page has nothing to say.
+  const updates =
+    !!versions?.notice
+    && (behind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
   return (
     <div className="flex flex-col gap-6 md:flex-row">
       <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">
@@ -2142,6 +3267,9 @@ export function Admin({
             >
               <Icon className="size-4" />
               {label}
+              {to === "/admin/update" && updates && (
+                <span className="ml-1 size-1.5 shrink-0 rounded-full bg-foreground md:ml-auto" title="有新版本" />
+              )}
             </button>
           )
         })}
@@ -2159,7 +3287,9 @@ export function Admin({
         ) : path === "/admin/security" ? (
           <Security site={site} />
         ) : path === "/admin/settings" ? (
-          <SettingsTab />
+          <SettingsTab onSaved={reloadMe} />
+        ) : path === "/admin/update" ? (
+          <Update versions={versions} reload={reload} nodes={nodes} site={site} refusal={refusal} />
         ) : (
           <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
         )}

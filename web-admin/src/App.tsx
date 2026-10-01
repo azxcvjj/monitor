@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react"
 import { ExternalLink, LogOut, Moon, Sun } from "lucide-react"
 import { Toaster } from "sonner"
 
@@ -6,6 +6,7 @@ import { Admin } from "@/components/Admin"
 import { Login } from "@/components/Login"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
+import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, provisionRefusal, useNodes } from "@/lib/api"
 
 type Me = { authed: boolean; github: boolean; site_name: string; public_page: boolean; site: string }
@@ -37,16 +38,52 @@ function usePath() {
   ] as const
 }
 
+const DARK_MEDIA = matchMedia("(prefers-color-scheme: dark)")
+
+/**
+ * The operator's own choice, or the system's while there is none. Only the toggle
+ * writes the choice down: persisting the system's answer on load would pin it,
+ * and the public theme served from the same origin reads this key too, so one
+ * visit to the panel would leave the status page in whichever mode the system
+ * happened to be in at that moment, no longer following it.
+ *
+ * The system's answer is subscribed to rather than copied into state: a flip
+ * landing between the first render and the effect that would have attached the
+ * listener is otherwise never heard, and the next one is a day away.
+ */
 function useTheme() {
-  const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("theme")
-    return saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches
-  })
+  const [saved, setSaved] = useState(() => localStorage.getItem("theme"))
+  const system = useSyncExternalStore(
+    (notify) => {
+      DARK_MEDIA.addEventListener("change", notify)
+      return () => DARK_MEDIA.removeEventListener("change", notify)
+    },
+    () => DARK_MEDIA.matches,
+  )
+  const dark = saved ? saved === "dark" : system
+
+  // Switched with every transition held. Buttons, badges and table rows fade
+  // their colours over 150 ms while everything else changes at once, leaving
+  // the page in both palettes for that long.
   useEffect(() => {
+    const hold = document.createElement("style")
+    hold.textContent = "*,*::before,*::after{transition:none!important}"
+    document.head.append(hold)
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("theme", dark ? "dark" : "light")
+    // Resolves the new colours while transitions are off, so removing the
+    // hold starts none.
+    void document.body.offsetWidth
+    hold.remove()
   }, [dark])
-  return [dark, () => setDark((d) => !d)] as const
+
+  return [
+    dark,
+    () => {
+      const next = dark ? "light" : "dark"
+      localStorage.setItem("theme", next)
+      setSaved(next)
+    },
+  ] as const
 }
 
 export default function App() {
@@ -57,13 +94,9 @@ export default function App() {
   const { nodes, admin, error, refresh } = useNodes()
 
   const loadMe = useCallback(() => {
-    // `|| "..."` because an empty message reads as no error: api() falls back to
-    // res.statusText, which HTTP/2 and HTTP/3 removed, so a bodiless 502 from a
-    // proxy arrives as "". The check below would then take the loading branch and
-    // the retry button would never render.
     return api<Me>("/me")
       .then((next) => { setMe(next); setMeError("") })
-      .catch((e: Error) => setMeError(e.message || "网络错误"))
+      .catch((e: Error) => setMeError(e.message))
   }, [])
   useEffect(() => {
     loadMe()
@@ -106,53 +139,58 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-svh">
-      <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
-          {/* The site name is the way back to the status page, as in the
-              theme's own header. */}
-          <a href="/" className="font-semibold transition-opacity hover:opacity-70">
-            {me.site_name || "Monitor"}
-          </a>
-          <span className="text-xs text-muted-foreground">后台</span>
-          <div className="flex-1" />
-          {/* The status page is a separate app, so this is a navigation. */}
-          <Button variant="ghost" size="sm" asChild>
-            <a href="/">
-              <ExternalLink /> 状态面板
+    // The browser's own title tooltip waits a second or more and cannot be
+    // shortened; these open after 300 ms.
+    <TooltipProvider delayDuration={300}>
+      <div className="min-h-svh">
+        <header className="sticky top-0 z-10 border-b bg-background/80 backdrop-blur">
+          <div className="mx-auto flex max-w-7xl items-center gap-3 px-4 py-3">
+            {/* The site name is the way back to the status page, as in the
+                theme's own header. */}
+            <a href="/" className="font-semibold transition-opacity hover:opacity-70">
+              {me.site_name || "Monitor"}
             </a>
-          </Button>
-          <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
-            {dark ? <Sun /> : <Moon />}
-          </Button>
-          <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
-            <LogOut />
-          </Button>
-        </div>
-      </header>
+            <span className="text-xs text-muted-foreground">后台</span>
+            <div className="flex-1" />
+            {/* The status page is a separate app, so this is a navigation. */}
+            <Button variant="ghost" size="sm" asChild>
+              <a href="/">
+                <ExternalLink /> 状态面板
+              </a>
+            </Button>
+            <Button variant="ghost" size="icon" onClick={toggleTheme} title="切换主题">
+              {dark ? <Sun /> : <Moon />}
+            </Button>
+            <Button variant="ghost" size="icon" onClick={signOut} title="退出登录">
+              <LogOut />
+            </Button>
+          </div>
+        </header>
 
-      <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
-        {error && <p className="text-sm text-destructive">{error}</p>}
-        {!nodes ? (
-          <Skeleton className="h-64" />
-        ) : (
-          <Admin
-            path={path}
-            go={go}
-            nodes={sorted}
-            refresh={refresh}
-            // The hub's own public URL rather than this browser's address: the
-            // panel is frequently reached over a loopback port behind a proxy,
-            // while the install command and OAuth callback need the real one.
-            site={me.site || location.origin}
-            // Why this page cannot add nodes, measured by the rule the hub applies
-            // to the `Origin` it receives; empty when it can.
-            refusal={provisionRefusal(location.origin, me.site)}
-          />
-        )}
-      </main>
+        <main className="mx-auto max-w-7xl space-y-5 px-4 py-6">
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          {!nodes ? (
+            <Skeleton className="h-64" />
+          ) : (
+            <Admin
+              path={path}
+              go={go}
+              nodes={sorted}
+              refresh={refresh}
+              // The hub's own public URL rather than this browser's address: the
+              // panel is frequently reached over a loopback port behind a proxy,
+              // while the install command and OAuth callback need the real one.
+              site={me.site || location.origin}
+              // Why this page cannot add nodes, measured by the rule the hub applies
+              // to the `Origin` it receives; empty when it can.
+              refusal={provisionRefusal(location.origin, me.site)}
+              reloadMe={loadMe}
+            />
+          )}
+        </main>
 
-      <Toaster position="top-center" theme={dark ? "dark" : "light"} />
-    </div>
+        <Toaster position="top-center" theme={dark ? "dark" : "light"} />
+      </div>
+    </TooltipProvider>
   )
 }
