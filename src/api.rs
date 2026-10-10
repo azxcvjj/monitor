@@ -4,9 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, Request, State};
 use axum::http::request::Parts;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -35,6 +36,32 @@ impl FromRequestParts<Shared> for Admin {
             Err(answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录"))
         }
     }
+}
+
+/// Whether a page other than the panel sent this request. `SameSite=Lax` holds
+/// a cookie back from other *sites*, but a sibling subdomain of the hub's
+/// registrable domain is the same site: its script may send a request without a
+/// body (`no-cors`, no preflight) and the cookie goes along, which suffices for
+/// a token reset or a vacuum. Browsers name where a request came from in
+/// `Sec-Fetch-Site`; only `same-origin` is the panel itself. The header is
+/// absent from a client that is not a browser, from a browser too old to send
+/// it, and from every browser on a plain-http address other than loopback; the
+/// last two are not told apart from the panel.
+fn from_other_origin(headers: &HeaderMap) -> bool {
+    headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
+}
+
+fn cross_site_write(method: &Method, headers: &HeaderMap) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) && from_other_origin(headers)
+}
+
+/// Refuses writes from another origin before any handler sees them, so a route
+/// added later is covered without remembering to ask.
+pub async fn same_origin_writes(request: Request, next: Next) -> Response {
+    if cross_site_write(request.method(), request.headers()) {
+        return answer(StatusCode::FORBIDDEN, "请求来自其他网站，已拒绝");
+    }
+    next.run(request).await
 }
 
 /// Marks a response whose text was written for the reader; see [`plain_errors`].
@@ -671,7 +698,12 @@ pub async fn live_ws(
 ) -> Response {
     // The digest rather than the result: signing out must reach a stream already
     // running, and only the row it names can report whether it has.
-    let session = current_session(&headers).filter(|hash| app.db.session_valid(hash));
+    // A sibling subdomain's script opens this with the cookie too, and a
+    // WebSocket is not held back by CORS: it would read the admin frame. Such a
+    // handshake is answered as an anonymous one.
+    let session = current_session(&headers)
+        .filter(|_| !from_other_origin(&headers))
+        .filter(|hash| app.db.session_valid(hash));
     if session.is_none() && !app.public_page() {
         return answer(StatusCode::UNAUTHORIZED, "需要登录后查看");
     }
@@ -804,15 +836,6 @@ fn provisioning_allowed(app: &App, headers: &HeaderMap) -> Result<(), &'static s
     };
     if https_domain(origin).is_none() && !(loopback_origin(origin) && !app.site.is_empty()) {
         debug!("provisioning refused: Origin {origin:?} is not an https domain entry");
-        return Err(PROVISIONING_DENIED);
-    }
-    // States that the request belongs to the page it addresses, which `Origin`
-    // alone does not: the panel is the only caller, and a page elsewhere holds no
-    // session here anyway, `SameSite=Lax` keeping the cookie from it. Browsers
-    // predating the header send none, and the origin above remains the test.
-    let fetch_site = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok());
-    if fetch_site.is_some_and(|site| site != "same-origin") {
-        debug!("provisioning refused: Sec-Fetch-Site {fetch_site:?} is not same-origin");
         return Err(PROVISIONING_DENIED);
     }
     Ok(())
@@ -2298,6 +2321,29 @@ mod tests {
         ])
     }
 
+    /// A sibling subdomain is the same site, so `SameSite=Lax` lets its bodiless
+    /// POST carry the session; only `Sec-Fetch-Site` tells it from the panel.
+    #[test]
+    fn a_write_from_another_origin_is_refused() {
+        let from = |site: &str| {
+            HeaderMap::from_iter([(header::HeaderName::from_static("sec-fetch-site"), site.parse().unwrap())])
+        };
+        for site in ["same-site", "cross-site", "none"] {
+            assert!(cross_site_write(&Method::POST, &from(site)), "{site}");
+            assert!(cross_site_write(&Method::DELETE, &from(site)), "{site}");
+        }
+        assert!(!cross_site_write(&Method::POST, &from("same-origin")));
+        assert!(!cross_site_write(&Method::POST, &HeaderMap::new()), "not a browser, or one too old to say");
+        assert!(
+            !cross_site_write(&Method::GET, &from("cross-site")),
+            "reads are answered to the page that cannot read them"
+        );
+        // A WebSocket handshake is a GET that the page can read.
+        assert!(from_other_origin(&from("same-site")));
+        assert!(!from_other_origin(&from("same-origin")));
+        assert!(!from_other_origin(&HeaderMap::new()));
+    }
+
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
     }
@@ -2372,10 +2418,6 @@ mod tests {
         let mut headers = good.clone();
         headers.remove(header::ORIGIN);
         assert_eq!(provisioning_allowed(&app, &headers), Err(ORIGIN_MISSING));
-        // A request sent from a page elsewhere.
-        headers = good.clone();
-        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(provisioning_allowed(&app, &headers).is_err());
 
         // Both panel paths refuse, and neither leaves anything behind.
         headers = good.clone();
