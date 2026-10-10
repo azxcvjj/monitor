@@ -1055,7 +1055,7 @@ pub async fn agent_register(
     // a POSIX `sh`.
     name: String,
 ) -> Response {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&app, &headers, peer.ip());
     // Counted separately from the sign-in page: a batch install started with a
     // stale key is a misconfigured deploy rather than an attack on the panel, and
     // a shared counter would lock the operator out of their own hub for LOCKOUT.
@@ -1455,6 +1455,7 @@ const READABLE_SETTINGS: &[&str] = &[
     "update_notice",
     "favicon",
     "touch_icon",
+    "origin_cdn_only",
 ];
 
 // ---- the database itself ----
@@ -1719,7 +1720,10 @@ async fn restore(app: &Shared, path: &str) -> Result<(), anyhow::Error> {
     let (app, source) = (app.clone(), path.to_owned());
     tokio::task::spawn_blocking(move || {
         app.db.check_backup(&source)?;
-        app.db.restore_from(&source)
+        app.db.restore_from(&source)?;
+        // A statement about where this hub is reachable from, which the file
+        // cannot carry to a different machine; the operator confirms it again.
+        app.db.set("origin_cdn_only", "off")
     })
     .await?
 }
@@ -2203,8 +2207,17 @@ pub async fn delete_session(_: Admin, State(app): State<Shared>, Path(id): Path<
     }
 }
 
-pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
+pub async fn settings(
+    _: Admin,
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut out = serde_json::Map::new();
+    // The address this request is taken for under the saved `origin_cdn_only`,
+    // so the admin can see whether the switch recognizes them: behind a CDN the
+    // proxy's own address means it does not.
+    out.insert("your_address".into(), json!(client_ip(&app, &headers, peer.ip()).to_string()));
     for key in READABLE_SETTINGS {
         out.insert((*key).to_owned(), json!(app.db.get(key).unwrap_or_default()));
     }
@@ -2266,6 +2279,9 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("密码至少 12 位".into()),
         "admin_password" => None,
+        "origin_cdn_only" if !matches!(value, "" | "on" | "off") => {
+            Some("源站只允许 CDN 访问：取值是 on 或 off".into())
+        }
         k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("没有这个设置项：{key}")),
@@ -2346,6 +2362,10 @@ mod tests {
 
     fn app() -> App {
         App::for_test(Db::open(":memory:").unwrap())
+    }
+
+    fn peer() -> ConnectInfo<std::net::SocketAddr> {
+        ConnectInfo("198.51.100.7:40000".parse().unwrap())
     }
 
     /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
@@ -2615,6 +2635,7 @@ mod tests {
         let live = dir.join("live.db").to_string_lossy().into_owned();
         let app = std::sync::Arc::new(App::for_test(Db::open(&live).unwrap()));
         node(&app, "kept", true);
+        app.db.set("origin_cdn_only", "on").unwrap();
 
         // What a restore actually receives: a backup of a hub database.
         let copy = format!("{live}.copy");
@@ -2632,6 +2653,11 @@ mod tests {
         .await;
         assert_eq!(done.status(), StatusCode::OK);
         assert_eq!(app.db.nodes().unwrap().len(), 1, "the backup went in");
+        assert_eq!(
+            app.db.get("origin_cdn_only").as_deref(),
+            Some("off"),
+            "the premise is the operator's to restate"
+        );
 
         // The database and its journal are the only files that may remain.
         let left: Vec<String> = std::fs::read_dir(&dir)
@@ -3957,8 +3983,9 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_hub_answers_settings_that_it_will_take_back() {
         let app = std::sync::Arc::new(app());
-        let Json(read) = settings(Admin, State(app.clone())).await;
+        let Json(read) = settings(Admin, State(app.clone()), peer(), HeaderMap::new()).await;
         assert_eq!(read["retention_days"], "30", "the default belongs in the answer, not in each caller");
+        assert_eq!(read["your_address"], "198.51.100.7");
 
         // Exactly what the panel sends, on a hub where nothing was ever set.
         let echoed = json!({
@@ -3991,7 +4018,8 @@ mod tests {
         app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
         app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
 
-        let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
+        let Json(body) =
+            settings(Admin, axum::extract::State(std::sync::Arc::new(app)), peer(), HeaderMap::new()).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
         assert_eq!(body["notify_webhook_url_set"], true);
